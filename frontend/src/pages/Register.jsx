@@ -27,7 +27,6 @@ export default function Register() {
   const [form, setForm] = useState({ full_name: '', email: '', password: '', phone: '' });
   const [showPass, setShowPass] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [showPINSetup, setShowPINSetup] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [secretKey, setSecretKey] = useState('');
   const [showSecretKey, setShowSecretKey] = useState(false);
@@ -53,8 +52,7 @@ export default function Register() {
       if (refCode) payload.referral_code = refCode;
       await register(payload);
       toast.success(t('register.success'));
-      setShowPINSetup(true);
-      navigate('/login');
+      navigate('/login', { state: { emailVerificationRequired: true } });
     } catch (err) {
       toast.error(err.response?.data?.error || t('register.error'));
     } finally {
