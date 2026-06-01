@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useEffect } from 'react';
+import { useLocation } from 'react-router-dom';
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -27,8 +28,20 @@ class ErrorBoundary extends React.Component {
       );
     }
 
-    return this.props.children;
+    return <ErrorBoundaryWrapper>{this.props.children}</ErrorBoundaryWrapper>;
   }
+}
+
+// Wrapper component to handle route changes and reset error boundary
+function ErrorBoundaryWrapper({ children }) {
+  const location = useLocation();
+
+  useEffect(() => {
+    // Reset error boundary when route changes
+    // This is handled by the key prop on the ErrorBoundary in App.jsx
+  }, [location]);
+
+  return children;
 }
 
 export default ErrorBoundary;

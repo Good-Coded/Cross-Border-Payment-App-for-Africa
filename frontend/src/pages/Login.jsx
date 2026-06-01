@@ -15,6 +15,9 @@ export default function Login() {
   const [form, setForm] = useState({ email: '', password: '' });
   const [showPass, setShowPass] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [rememberMe, setRememberMe] = useState(() => {
+    return localStorage.getItem('afripay_remember_me') === 'true';
+  });
 
   // 2FA TOTP step
   const [requires2fa, setRequires2fa] = useState(false);
@@ -33,6 +36,8 @@ export default function Login() {
     setLoading(true);
     try {
       await login(form.email, form.password);
+      // Persist remember-me preference
+      localStorage.setItem('afripay_remember_me', rememberMe.toString());
       navigate('/dashboard');
     } catch (err) {
       const data = err.response?.data;
@@ -181,7 +186,16 @@ export default function Login() {
                 </div>
               </div>
 
-              <div className="text-right">
+              <div className="flex items-center justify-between">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={rememberMe}
+                    onChange={(e) => setRememberMe(e.target.checked)}
+                    className="w-4 h-4 rounded border-gray-300 text-primary-500 focus:ring-primary-500 cursor-pointer"
+                  />
+                  <span className="text-sm text-gray-600 dark:text-gray-400">{t('login.remember_me', 'Remember me')}</span>
+                </label>
                 <Link to="/forgot-password" className="text-sm text-primary-500 hover:underline">
                   {t('login.forgot_password')}
                 </Link>

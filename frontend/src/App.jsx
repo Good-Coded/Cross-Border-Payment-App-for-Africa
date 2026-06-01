@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { Toaster } from "react-hot-toast";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { ThemeProvider } from "./context/ThemeContext";
@@ -10,7 +10,10 @@ import Register from "./pages/Register";
 import ForgotPassword from "./pages/ForgotPassword";
 import ResetPassword from "./pages/ResetPassword";
 import Dashboard from "./pages/Dashboard";
+import SendMoney from "./pages/SendMoney";
+import ReceiveMoney from "./pages/ReceiveMoney";
 import SaveMoney from "./pages/SaveMoney";
+import ReceiveMoney from "./pages/ReceiveMoney";
 import RequestMoney from "./pages/RequestMoney";
 import ScheduledPayments from "./pages/ScheduledPayments";
 import TransactionHistory from "./pages/TransactionHistory";
@@ -43,6 +46,82 @@ function PublicRoute({ children }) {
   return user ? <Navigate to="/dashboard" replace /> : children;
 }
 
+function AppRoutes() {
+  const location = useLocation();
+
+  return (
+    <ErrorBoundary key={location.pathname}>
+      <Routes>
+        <Route
+          path="/"
+          element={
+            <PublicRoute>
+              <Welcome />
+            </PublicRoute>
+          }
+        />
+        <Route
+          path="/login"
+          element={
+            <PublicRoute>
+              <Login />
+            </PublicRoute>
+          }
+        />
+        <Route
+          path="/register"
+          element={
+            <PublicRoute>
+              <Register />
+            </PublicRoute>
+          }
+        />
+        <Route
+          path="/forgot-password"
+          element={
+            <PublicRoute>
+              <ForgotPassword />
+            </PublicRoute>
+          }
+        />
+        <Route
+          path="/reset-password"
+          element={
+            <PublicRoute>
+              <ResetPassword />
+            </PublicRoute>
+          }
+        />
+        <Route
+          path="/"
+          element={
+            <PrivateRoute>
+              <Layout />
+            </PrivateRoute>
+          }
+        >
+          <Route path="dashboard" element={<Dashboard />} />
+          <Route path="send" element={<SendMoney />} />
+          <Route path="batch-payments" element={<BatchPayment />} />
+          <Route path="receive" element={<ReceiveMoney />} />
+          <Route path="save" element={<SaveMoney />} />
+          <Route path="request" element={<RequestMoney />} />
+          <Route path="scheduled" element={<ScheduledPayments />} />
+          <Route path="history" element={<TransactionHistory />} />
+          <Route path="analytics" element={<Analytics />} />
+          <Route path="profile" element={<Profile />} />
+          <Route path="sessions" element={<Sessions />} />
+          <Route path="kyc" element={<KYCVerification />} />
+          <Route path="webhooks" element={<Webhooks />} />
+          <Route path="business" element={<BusinessSettings />} />
+          <Route path="swap" element={<Swap />} />
+          <Route path="referrals" element={<Referrals />} />
+        </Route>
+      </Routes>
+    </ErrorBoundary>
+  );
+}
+
 export default function App() {
   const [isOffline, setIsOffline] = useState(
     typeof navigator !== "undefined" ? !navigator.onLine : false
@@ -62,7 +141,7 @@ export default function App() {
   }, []);
 
   return (
-    <ErrorBoundary>
+    <>
       {isOffline && (
         <div
           role="alert"
@@ -97,76 +176,4 @@ export default function App() {
                 "aria-atomic": "true",
               }}
             />
-            <Routes>
-              <Route
-                path="/"
-                element={
-                  <PublicRoute>
-                    <Welcome />
-                  </PublicRoute>
-                }
-              />
-              <Route
-                path="/login"
-                element={
-                  <PublicRoute>
-                    <Login />
-                  </PublicRoute>
-                }
-              />
-              <Route
-                path="/register"
-                element={
-                  <PublicRoute>
-                    <Register />
-                  </PublicRoute>
-                }
-              />
-              <Route
-                path="/forgot-password"
-                element={
-                  <PublicRoute>
-                    <ForgotPassword />
-                  </PublicRoute>
-                }
-              />
-              <Route
-                path="/reset-password"
-                element={
-                  <PublicRoute>
-                    <ResetPassword />
-                  </PublicRoute>
-                }
-              />
-              <Route
-                path="/"
-                element={
-                  <PrivateRoute>
-                    <Layout />
-                  </PrivateRoute>
-                }
-              >
-                <Route path="dashboard" element={<Dashboard />} />
-                <Route path="send" element={<SendMoney />} />
-                <Route path="batch-payments" element={<BatchPayment />} />
-                <Route path="receive" element={<ReceiveMoney />} />
-                <Route path="save" element={<SaveMoney />} />
-                <Route path="request" element={<RequestMoney />} />
-                <Route path="scheduled" element={<ScheduledPayments />} />
-                <Route path="history" element={<TransactionHistory />} />
-                <Route path="analytics" element={<Analytics />} />
-                <Route path="profile" element={<Profile />} />
-                <Route path="sessions" element={<Sessions />} />
-                <Route path="kyc" element={<KYCVerification />} />
-                <Route path="webhooks" element={<Webhooks />} />
-                <Route path="business" element={<BusinessSettings />} />
-                <Route path="swap" element={<Swap />} />
-                <Route path="referrals" element={<Referrals />} />
-              </Route>
-            </Routes>
-          </BrowserRouter>
-        </ThemeProvider>
-      </AuthProvider>
-    </ErrorBoundary>
-  );
-}
+            <AppRoutes />

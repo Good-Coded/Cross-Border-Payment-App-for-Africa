@@ -1,12 +1,13 @@
 import React, { useEffect, useState, useMemo, useCallback } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { ArrowLeft, Send, Download, ExternalLink, Filter, Search, Flag, X, WifiOff } from 'lucide-react';
+import { ArrowLeft, Send, Download, ExternalLink, Filter, Search, Flag, X, WifiOff, Loader2, Copy, CheckCheck } from 'lucide-react';
 import api from '../utils/api';
 import { truncateAddress } from '../utils/currency';
 import { TransactionCardSkeleton } from '../components/Skeleton';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import { setCacheEntry, getCacheEntry } from '../utils/offlineDB';
 import { useTranslation } from 'react-i18next';
+import toast from 'react-hot-toast';
 
 const STATUS_COLORS = {
   completed: 'text-primary-400 bg-primary-500/10',
@@ -89,6 +90,8 @@ export default function TransactionHistory() {
   const [reportDesc, setReportDesc] = useState('');
   const [reportLoading, setReportLoading] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
+  const [selectedTx, setSelectedTx] = useState(null); // tx detail modal
+  const [copiedHash, setCopiedHash] = useState(false);
 
   const fetchInitial = useCallback(async () => {
     setLoading(true);
@@ -210,21 +213,20 @@ export default function TransactionHistory() {
     if (exporting) return;
     setExporting(true);
     try {
-      const params = {};
+      const params = { format: 'csv' };
       if (dateFrom) params.from = dateFrom;
       if (dateTo) params.to = dateTo;
       if (asset) params.asset = asset;
       if (filter !== 'all') params.direction = filter;
-      const res = await api.get('/payments/export', { params, responseType: 'blob' });
+      const res = await api.get('/payments/history', { params, responseType: 'blob' });
       const url = URL.createObjectURL(new Blob([res.data], { type: 'text/csv' }));
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'transactions.csv';
+      a.download = `transactions_${new Date().toISOString().split('T')[0]}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-      toast.success('CSV downloaded');
     } catch {
-      toast.error('Export failed. Please try again.');
+      alert('Export failed. Please try again.');
     } finally {
       setExporting(false);
     }
@@ -408,7 +410,11 @@ export default function TransactionHistory() {
         <>
           <div className="space-y-3">
             {filtered.map((tx) => (
-              <div key={tx.id} className="bg-gray-900 rounded-xl p-4">
+              <button
+                key={tx.id}
+                onClick={() => setSelectedTx(tx)}
+                className="w-full bg-gray-900 rounded-xl p-4 hover:bg-gray-800 transition-colors text-left"
+              >
                 <div className="flex items-start gap-3">
                   <div
                     className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${
@@ -471,13 +477,17 @@ export default function TransactionHistory() {
                             target="_blank"
                             rel="noopener noreferrer"
                             className="text-gray-500 hover:text-primary-400 transition-colors"
+                            onClick={(e) => e.stopPropagation()}
                           >
                             <ExternalLink size={12} aria-label="View transaction on Stellar Explorer" />
                           </a>
                         )}
                         <button
                           type="button"
-                          onClick={() => setReportTx(tx)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setReportTx(tx);
+                          }}
                           className="text-gray-500 hover:text-yellow-400 transition-colors"
                           aria-label="Report issue with this transaction"
                           title="Report Issue"
@@ -488,7 +498,7 @@ export default function TransactionHistory() {
                     </div>
                   </div>
                 </div>
-              </div>
+              </button>
             ))}
           </div>
           {hasMore && (
@@ -503,6 +513,107 @@ export default function TransactionHistory() {
           )}
         </>
       )}
+      {/* Transaction Detail Modal */}
+      {selectedTx && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 rounded-2xl w-full max-w-sm overflow-hidden">
+            <div className="flex items-center justify-between p-5 border-b border-gray-800">
+              <h3 className="font-semibold text-white">Transaction Details</h3>
+              <button onClick={() => setSelectedTx(null)} className="text-gray-400 hover:text-white">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              {/* Amount */}
+              <div>
+                <p className="text-xs text-gray-500 mb-1">Amount</p>
+                <p className={`text-lg font-bold ${selectedTx.direction === 'sent' ? 'text-red-400' : 'text-primary-400'}`}>
+                  {selectedTx.direction === 'sent' ? '-' : '+'}
+                  {selectedTx.amount} {selectedTx.asset}
+                </p>
+              </div>
+
+              {/* Status */}
+              <div>
+                <p className="text-xs text-gray-500 mb-1">Status</p>
+                <span className={`text-sm px-2 py-1 rounded-full inline-block ${STATUS_COLORS[selectedTx.status] || STATUS_COLORS.pending}`}>
+                  {selectedTx.status}
+                </span>
+              </div>
+
+              {/* Memo */}
+              {selectedTx.memo && (
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">Memo</p>
+                  <p className="text-sm text-white font-mono break-all">{selectedTx.memo}</p>
+                </div>
+              )}
+
+              {/* Fee */}
+              {selectedTx.fee && (
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">Fee</p>
+                  <p className="text-sm text-white">{selectedTx.fee} XLM</p>
+                </div>
+              )}
+
+              {/* From/To */}
+              <div>
+                <p className="text-xs text-gray-500 mb-1">
+                  {selectedTx.direction === 'sent' ? 'To' : 'From'}
+                </p>
+                <p className="text-sm text-white font-mono break-all">
+                  {selectedTx.direction === 'sent' ? selectedTx.recipient_wallet : selectedTx.sender_wallet}
+                </p>
+              </div>
+
+              {/* Date */}
+              <div>
+                <p className="text-xs text-gray-500 mb-1">Date</p>
+                <p className="text-sm text-white">
+                  {new Date(selectedTx.ledger_close_time || selectedTx.created_at).toLocaleString()}
+                </p>
+              </div>
+
+              {/* Transaction Hash */}
+              {selectedTx.tx_hash && (
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">Transaction Hash</p>
+                  <div className="flex items-center gap-2 bg-gray-800 rounded-lg px-3 py-2">
+                    <span className="text-xs text-gray-300 font-mono flex-1 truncate">{truncateAddress(selectedTx.tx_hash, 12)}</span>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(selectedTx.tx_hash);
+                        setCopiedHash(true);
+                        setTimeout(() => setCopiedHash(false), 2000);
+                        toast.success('Hash copied');
+                      }}
+                      className="text-gray-400 hover:text-white transition-colors shrink-0"
+                      title="Copy hash"
+                    >
+                      {copiedHash ? <CheckCheck size={14} className="text-green-400" /> : <Copy size={14} />}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Stellar Explorer Link */}
+              {selectedTx.tx_hash && (
+                <a
+                  href={`https://stellar.expert/explorer/testnet/tx/${selectedTx.tx_hash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full flex items-center justify-center gap-2 bg-primary-500 hover:bg-primary-600 text-white font-semibold py-2.5 rounded-xl text-sm transition-colors"
+                >
+                  <ExternalLink size={14} />
+                  View on Stellar Explorer
+                </a>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Report Issue Modal */}
       {reportTx && (
         <div className="fixed inset-0 bg-black/70 flex items-end justify-center z-50 p-4">

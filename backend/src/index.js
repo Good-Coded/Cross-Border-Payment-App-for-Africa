@@ -101,11 +101,15 @@ io.on('connection', async (socket) => {
   });
 });
 require('dotenv').config();
-const validateEnv = require('./utils/validateEnv');
+
 const logger = require('./utils/logger');
+const validateEnv = require('./utils/validateEnv');
+const app = require('./app');
+const { startScheduler } = require('./scheduler');
 const { startScheduler } = require('./jobs/scheduler');
 
 ledgerListener.setSocketIO(io);
+ledgerListener.initStreams();
 
 async function shutdown(signal) {
   logger.info(`${signal} received — shutting down gracefully`);

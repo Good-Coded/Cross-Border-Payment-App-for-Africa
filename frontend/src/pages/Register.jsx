@@ -2,22 +2,10 @@ import React, { useState, useMemo } from 'react';
 import { useNavigate, Link, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import toast from 'react-hot-toast';
-import { Eye, EyeOff, ArrowLeft, ChevronDown, ChevronUp, Check, X } from 'lucide-react';
+import { Eye, EyeOff, ArrowLeft, ChevronDown, ChevronUp, Check, X, Phone } from 'lucide-react';
+import { Eye, EyeOff, ArrowLeft, ChevronDown, ChevronUp, Check, X, AlertCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-
-function getPasswordStrength(password) {
-  const checks = {
-    length: password.length >= 8,
-    uppercase: /[A-Z]/.test(password),
-    number: /[0-9]/.test(password),
-    special: /[^A-Za-z0-9]/.test(password),
-  };
-  const score = Object.values(checks).filter(Boolean).length;
-  const levels = ['', 'weak', 'fair', 'strong', 'very strong'];
-  const colors = ['', 'bg-red-500', 'bg-orange-500', 'bg-yellow-500', 'bg-green-500'];
-  const textColors = ['', 'text-red-500', 'text-orange-500', 'text-yellow-500', 'text-green-500'];
-  return { checks, score, label: levels[score], barColor: colors[score], textColor: textColors[score] };
-}
+import { getPasswordStrength, validateEmail, getEmailError, getPasswordError } from '../utils/passwordValidator';
 
 export default function Register() {
   const { register } = useAuth();
@@ -31,11 +19,38 @@ export default function Register() {
   const [secretKey, setSecretKey] = useState('');
   const [showSecretKey, setShowSecretKey] = useState(false);
   const [secretKeyError, setSecretKeyError] = useState('');
+  const [touched, setTouched] = useState({ full_name: false, email: false, password: false });
+
+  // Phone verification state (issue #478)
+  const [showPhoneVerify, setShowPhoneVerify] = useState(false);
+  const [phoneOtp, setPhoneOtp] = useState('');
+  const [phoneVerifyLoading, setPhoneVerifyLoading] = useState(false);
+  const [registeredPhone, setRegisteredPhone] = useState('');
 
   const strength = useMemo(() => getPasswordStrength(form.password), [form.password]);
+  const emailError = touched.email ? getEmailError(form.email) : '';
+  const passwordError = touched.password ? getPasswordError(form.password) : '';
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+
+    // Mark all fields as touched for validation
+    setTouched({ full_name: true, email: true, password: true });
+
+    // Validate required fields
+    if (!form.full_name.trim()) {
+      toast.error('Full name is required');
+      return;
+    }
+    if (emailError) {
+      toast.error(emailError);
+      return;
+    }
+    if (passwordError) {
+      toast.error(passwordError);
+      return;
+    }
+
     if (showImport && secretKey) {
       // Validate Stellar secret key: starts with 'S', 56 chars, base32
       const isValid = /^S[A-Z2-7]{55}$/.test(secretKey);
@@ -52,7 +67,14 @@ export default function Register() {
       if (refCode) payload.referral_code = refCode;
       await register(payload);
       toast.success(t('register.success'));
-      navigate('/login', { state: { emailVerificationRequired: true } });
+      setShowPINSetup(true);
+      // If phone was provided, show verification step (issue #478)
+      if (form.phone && form.phone.trim()) {
+        setRegisteredPhone(form.phone);
+        setShowPhoneVerify(true);
+      } else {
+        navigate('/login');
+      }
     } catch (err) {
       toast.error(err.response?.data?.error || t('register.error'));
     } finally {
@@ -60,51 +82,96 @@ export default function Register() {
     }
   };
 
+  const handlePhoneVerify = async (e) => {
+    e.preventDefault();
+    setPhoneVerifyLoading(true);
+    try {
+      // Note: This requires authentication, so user needs to login first
+      // For now, we'll navigate to login and show a message
+      toast.success('Account created. Please log in to verify your phone number.');
+      navigate('/login');
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to verify phone');
+    } finally {
+      setPhoneVerifyLoading(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950 flex flex-col px-6 py-8 transition-colors duration-200">
-      <button onClick={() => navigate('/')} className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white mb-6 flex items-center gap-1 transition-colors">
+      <button
+        onClick={() => navigate('/')}
+        className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white mb-6 flex items-center gap-1 transition-colors"
+      >
         <ArrowLeft size={18} /> {t('common.back')}
       </button>
 
       <div className="flex-1 flex flex-col justify-center max-w-sm mx-auto w-full">
-        <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-1">{t('register.title')}</h2>
+        <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-1">
+          {t('register.title')}
+        </h2>
         <p className="text-gray-600 dark:text-gray-400 mb-8">{t('register.subtitle')}</p>
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="text-sm text-gray-600 dark:text-gray-400 mb-1 block">{t('register.full_name')}</label>
+            <label className="text-sm text-gray-600 dark:text-gray-400 mb-1 block">
+              {t('register.full_name')}
+            </label>
             <input
               type="text"
               required
               placeholder="[Full Name]"
               value={form.full_name}
+              onChange={(e) => setForm({ ...form, full_name: e.target.value })}
               onChange={e => setForm({ ...form, full_name: e.target.value })}
+              onBlur={() => setTouched({ ...touched, full_name: true })}
               className="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-primary-500 transition-colors shadow-sm"
             />
+            {touched.full_name && !form.full_name.trim() && (
+              <p className="text-xs text-red-500 mt-1 flex items-center gap-1">
+                <AlertCircle size={12} /> Full name is required
+              </p>
+            )}
           </div>
           <div>
-            <label className="text-sm text-gray-600 dark:text-gray-400 mb-1 block">{t('register.email')}</label>
+            <label className="text-sm text-gray-600 dark:text-gray-400 mb-1 block">
+              {t('register.email')}
+            </label>
             <input
               type="email"
               required
               placeholder="[email]"
               value={form.email}
-              onChange={e => setForm({ ...form, email: e.target.value })}
+              onChange={(e) => setForm({ ...form, email: e.target.value })}
               className="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-primary-500 transition-colors shadow-sm"
+              onChange={e => setForm({ ...form, email: e.target.value })}
+              onBlur={() => setTouched({ ...touched, email: true })}
+              className={`w-full bg-white dark:bg-gray-800 border rounded-xl px-4 py-3 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-primary-500 transition-colors shadow-sm ${
+                emailError ? 'border-red-500 dark:border-red-500' : 'border-gray-200 dark:border-gray-700'
+              }`}
             />
+            {emailError && (
+              <p className="text-xs text-red-500 mt-1 flex items-center gap-1">
+                <AlertCircle size={12} /> {emailError}
+              </p>
+            )}
           </div>
           <div>
-            <label className="text-sm text-gray-600 dark:text-gray-400 mb-1 block">{t('register.phone')}</label>
+            <label className="text-sm text-gray-600 dark:text-gray-400 mb-1 block">
+              {t('register.phone')}
+            </label>
             <input
               type="tel"
               placeholder="+234..."
               value={form.phone}
-              onChange={e => setForm({ ...form, phone: e.target.value })}
+              onChange={(e) => setForm({ ...form, phone: e.target.value })}
               className="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-primary-500 transition-colors shadow-sm"
             />
           </div>
           <div>
-            <label className="text-sm text-gray-600 dark:text-gray-400 mb-1 block">{t('register.password')}</label>
+            <label className="text-sm text-gray-600 dark:text-gray-400 mb-1 block">
+              {t('register.password')}
+            </label>
             <div className="relative">
               <input
                 type={showPass ? 'text' : 'password'}
@@ -112,30 +179,54 @@ export default function Register() {
                 minLength={8}
                 placeholder={t('register.password_placeholder')}
                 value={form.password}
-                onChange={e => setForm({ ...form, password: e.target.value })}
+                onChange={(e) => setForm({ ...form, password: e.target.value })}
                 className="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-primary-500 transition-colors pr-12 shadow-sm"
+                onChange={e => setForm({ ...form, password: e.target.value })}
+                onBlur={() => setTouched({ ...touched, password: true })}
+                className={`w-full bg-white dark:bg-gray-800 border rounded-xl px-4 py-3 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-primary-500 transition-colors pr-12 shadow-sm ${
+                  passwordError ? 'border-red-500 dark:border-red-500' : 'border-gray-200 dark:border-gray-700'
+                }`}
               />
-              <button type="button" onClick={() => setShowPass(!showPass)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-white transition-colors">
+              <button
+                type="button"
+                onClick={() => setShowPass(!showPass)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-white transition-colors"
+              >
                 {showPass ? <EyeOff size={18} /> : <Eye size={18} />}
               </button>
             </div>
+            {passwordError && (
+              <p className="text-xs text-red-500 mt-1 flex items-center gap-1">
+                <AlertCircle size={12} /> {passwordError}
+              </p>
+            )}
             {form.password && (
               <div className="mt-2 space-y-2">
                 <div className="flex gap-1">
-                  {[1, 2, 3, 4].map(i => (
+                  {[1, 2, 3, 4].map((i) => (
+                    <div
+                      key={i}
+                      className={`h-1 flex-1 rounded-full transition-colors ${i <= strength.score ? strength.barColor : 'bg-gray-200 dark:bg-gray-700'}`}
+                    />
+                  {[1, 2, 3, 4, 5].map(i => (
                     <div key={i} className={`h-1 flex-1 rounded-full transition-colors ${i <= strength.score ? strength.barColor : 'bg-gray-200 dark:bg-gray-700'}`} />
                   ))}
                 </div>
-                <p className={`text-xs font-medium capitalize ${strength.textColor}`}>{strength.label}</p>
+                <p className={`text-xs font-medium capitalize ${strength.textColor}`}>
+                  {strength.label}
+                </p>
                 <ul className="space-y-1">
                   {[
                     { key: 'length', label: 'At least 8 characters' },
                     { key: 'uppercase', label: 'One uppercase letter' },
+                    { key: 'lowercase', label: 'One lowercase letter' },
                     { key: 'number', label: 'One number' },
                     { key: 'special', label: 'One special character' },
                   ].map(({ key, label }) => (
-                    <li key={key} className={`flex items-center gap-1.5 text-xs ${strength.checks[key] ? 'text-green-500' : 'text-gray-400 dark:text-gray-500'}`}>
+                    <li
+                      key={key}
+                      className={`flex items-center gap-1.5 text-xs ${strength.checks[key] ? 'text-green-500' : 'text-gray-400 dark:text-gray-500'}`}
+                    >
                       {strength.checks[key] ? <Check size={12} /> : <X size={12} />} {label}
                     </li>
                   ))}
@@ -146,7 +237,7 @@ export default function Register() {
 
           <button
             type="submit"
-            disabled={loading || strength.score < 2}
+            disabled={loading || !form.full_name.trim() || emailError || passwordError}
             className="w-full bg-primary-500 hover:bg-primary-600 disabled:opacity-50 text-white font-semibold py-3.5 rounded-xl transition-colors mt-2"
           >
             {loading ? t('register.submitting') : t('register.submit')}
@@ -156,7 +247,12 @@ export default function Register() {
           <div className="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden">
             <button
               type="button"
-              onClick={() => { setShowImport(v => !v); setSecretKey(''); setSecretKeyError(''); setShowSecretKey(false); }}
+              onClick={() => {
+                setShowImport((v) => !v);
+                setSecretKey('');
+                setSecretKeyError('');
+                setShowSecretKey(false);
+              }}
               className="w-full flex items-center justify-between px-4 py-3 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
             >
               <span>Already have a Stellar wallet? Import it</span>
@@ -172,21 +268,22 @@ export default function Register() {
                     type={showSecretKey ? 'text' : 'password'}
                     placeholder="Stellar secret key (starts with S…)"
                     value={secretKey}
-                    onChange={e => { setSecretKey(e.target.value); setSecretKeyError(''); }}
+                    onChange={(e) => {
+                      setSecretKey(e.target.value);
+                      setSecretKeyError('');
+                    }}
                     className={`w-full bg-white dark:bg-gray-800 border rounded-xl px-4 py-3 text-gray-900 dark:text-white placeholder-gray-400 font-mono text-sm focus:outline-none focus:border-primary-500 transition-colors pr-12 ${secretKeyError ? 'border-red-500' : 'border-gray-200 dark:border-gray-700'}`}
                   />
                   <button
                     type="button"
-                    onClick={() => setShowSecretKey(v => !v)}
+                    onClick={() => setShowSecretKey((v) => !v)}
                     className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-white transition-colors"
                     aria-label={showSecretKey ? 'Hide secret key' : 'Show secret key'}
                   >
                     {showSecretKey ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
                 </div>
-                {secretKeyError && (
-                  <p className="text-xs text-red-500">{secretKeyError}</p>
-                )}
+                {secretKeyError && <p className="text-xs text-red-500">{secretKeyError}</p>}
               </div>
             )}
           </div>
@@ -194,9 +291,61 @@ export default function Register() {
 
         <p className="text-center text-gray-500 mt-6 text-sm">
           {t('register.have_account')}{' '}
-          <Link to="/login" className="text-primary-500 hover:underline">{t('register.sign_in')}</Link>
+          <Link to="/login" className="text-primary-500 hover:underline">
+            {t('register.sign_in')}
+          </Link>
         </p>
       </div>
+
+      {/* Phone Verification Step (issue #478) */}
+      {showPhoneVerify && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+          <div className="bg-white dark:bg-gray-900 rounded-2xl p-6 w-full max-w-sm space-y-4">
+            <div className="text-center">
+              <Phone size={32} className="text-primary-500 mx-auto mb-3" />
+              <h3 className="text-lg font-bold text-gray-900 dark:text-white">Verify Your Phone</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                We sent a 6-digit OTP to {registeredPhone}
+              </p>
+            </div>
+            <form onSubmit={handlePhoneVerify} className="space-y-4">
+              <input
+                type="text"
+                inputMode="numeric"
+                pattern="\d{6}"
+                maxLength={6}
+                required
+                placeholder="Enter 6-digit OTP"
+                value={phoneOtp}
+                onChange={(e) => setPhoneOtp(e.target.value.replace(/\D/g, ''))}
+                className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3 text-gray-900 dark:text-white text-center text-xl font-mono tracking-widest placeholder-gray-400 focus:outline-none focus:border-primary-500"
+              />
+              <p className="text-xs text-gray-500 dark:text-gray-400 text-center">
+                For security, please log in first to complete phone verification.
+              </p>
+              <div className="flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowPhoneVerify(false);
+                    navigate('/login');
+                  }}
+                  className="flex-1 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-900 dark:text-white text-sm font-medium py-2.5 rounded-xl transition-colors"
+                >
+                  Skip for Now
+                </button>
+                <button
+                  type="submit"
+                  disabled={phoneVerifyLoading || phoneOtp.length !== 6}
+                  className="flex-1 bg-primary-500 hover:bg-primary-600 disabled:opacity-50 text-white text-sm font-semibold py-2.5 rounded-xl transition-colors"
+                >
+                  {phoneVerifyLoading ? 'Verifying…' : 'Verify & Login'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

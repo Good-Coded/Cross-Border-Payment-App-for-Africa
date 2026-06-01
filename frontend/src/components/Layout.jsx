@@ -1,6 +1,6 @@
 import React from 'react';
 import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Send, Download, Clock, Upload, User, LogOut, Sun, Moon, Bell, BellOff, AlertTriangle, ArrowUpDown } from 'lucide-react';
+import { LayoutDashboard, Send, Download, Clock, Upload, User, LogOut, Sun, Moon, Bell, BellOff, AlertTriangle, ArrowUpDown, PiggyBank } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { usePushNotifications } from '../hooks/usePushNotifications';
@@ -10,8 +10,8 @@ import OfflineBanner from './OfflineBanner';
 const navItems = [
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/send', icon: Send, label: 'Send' },
-  { to: '/batch-payments', icon: Upload, label: 'Batch' },
   { to: '/swap', icon: ArrowUpDown, label: 'Swap' },
+  { to: '/save', icon: PiggyBank, label: 'Save' },
   { to: '/receive', icon: Download, label: 'Receive' },
   { to: '/history', icon: Clock, label: 'History' },
   { to: '/profile', icon: User, label: 'Profile' },
@@ -58,6 +58,12 @@ export default function Layout() {
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 bg-primary-500 rounded-lg flex items-center justify-center text-sm font-bold text-white">A</div>
           <span className="font-semibold text-gray-900 dark:text-white">AfriPay</span>
+          <div className="flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800 text-[10px] font-medium border border-gray-200 dark:border-gray-700">
+            <div className={`w-1.5 h-1.5 rounded-full ${isDegraded ? 'bg-yellow-500 animate-pulse' : 'bg-green-500'}`} />
+            <span className="text-gray-600 dark:text-gray-400">
+              {isDegraded ? 'Degraded' : 'Network Active'}
+            </span>
+          </div>
         </div>
         <div className="flex items-center gap-3">
           <button onClick={toggleTheme} className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white transition-colors" title="Toggle theme">

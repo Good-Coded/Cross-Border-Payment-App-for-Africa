@@ -35,7 +35,9 @@ const disputeRoutes = require('./routes/disputes');
 const pricesRoutes = require('./routes/prices');
 const channelsRoutes = require('./routes/channels');
 const contractsRoutes = require('./routes/contracts');
+const ledgerRoutes = require('./routes/ledger');
 const ipAllowlist = require('./middleware/ipAllowlist');
+const geoRestriction = require('./middleware/geoRestriction');
 
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
@@ -86,9 +88,9 @@ app.use('/api/auth', authLimiter);
 
 app.use('/api/auth', authRoutes);
 app.use('/api/wallet', walletRoutes);
-app.use('/api/payments', paymentRoutes);
-app.use('/api/payment-requests', paymentRequestRoutes);
-app.use('/api/scheduled-payments', scheduledPaymentRoutes);
+app.use('/api/payments', geoRestriction, paymentRoutes);
+app.use('/api/payment-requests', geoRestriction, paymentRequestRoutes);
+app.use('/api/scheduled-payments', geoRestriction, scheduledPaymentRoutes);
 app.use('/api/anchor', anchorRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/dex', dexRoutes);
@@ -102,8 +104,10 @@ app.use('/api/admin', ipAllowlist, adminRoutes);
 app.use('/api/prices', pricesRoutes);
 app.use('/api/channels', channelsRoutes);
 app.use('/api/contracts', contractsRoutes);
+app.use('/api/ledger', ledgerRoutes);
 app.use('/api/webhooks', webhookRoutes);
-app.use('/api/dev', toolsRoutes);
+app.use('/api/tools', toolsRoutes);
+app.use('/api/dev', toolsRoutes); // legacy alias
 app.use('/api/assets', assetsRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/.well-known/stellar', sep10Routes);

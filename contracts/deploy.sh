@@ -135,6 +135,13 @@ else
     echo -e "${YELLOW}Note: contract optimize not available, skipping${NC}"
 fi
 
+# Step 3.5: Compute expected WASM hash
+echo -e "\n${YELLOW}Step 3.5: Computing WASM hash...${NC}"
+
+EXPECTED_WASM_HASH=$(sha256sum "$WASM_FILE" | awk '{print $1}')
+echo "Expected WASM hash: $EXPECTED_WASM_HASH"
+echo -e "${GREEN}✓ WASM hash computed${NC}"
+
 # Step 4: Deploy to Stellar Network
 echo -e "\n${YELLOW}Step 4: Deploying to $NETWORK...${NC}"
 
@@ -178,6 +185,31 @@ fi
 echo -e "${GREEN}✓ Contract deployed successfully${NC}"
 echo "Contract ID: $CONTRACT_ID"
 
+# Step 4.5: Verify WASM hash
+echo -e "\n${YELLOW}Step 4.5: Verifying WASM hash...${NC}"
+
+# Fetch the contract's ledger entry to get the WASM hash
+DEPLOYED_WASM_HASH=$($SOROBAN_CLI contract info --id "$CONTRACT_ID" --network "$NETWORK" 2>/dev/null | grep -i "wasm_hash\|hash" | head -1 | awk -F': ' '{print $2}' || true)
+
+if [ -z "$DEPLOYED_WASM_HASH" ]; then
+    echo -e "${YELLOW}Note: Could not fetch deployed WASM hash from network. Verify manually.${NC}"
+    echo "Expected WASM hash: $EXPECTED_WASM_HASH"
+else
+    # Normalize hashes (remove 0x prefix if present and convert to lowercase)
+    EXPECTED_NORMALIZED=$(echo "$EXPECTED_WASM_HASH" | tr '[:upper:]' '[:lower:]' | sed 's/^0x//')
+    DEPLOYED_NORMALIZED=$(echo "$DEPLOYED_WASM_HASH" | tr '[:upper:]' '[:lower:]' | sed 's/^0x//')
+    
+    if [ "$EXPECTED_NORMALIZED" = "$DEPLOYED_NORMALIZED" ]; then
+        echo -e "${GREEN}✓ WASM hash verified: $EXPECTED_WASM_HASH${NC}"
+    else
+        echo -e "${RED}Error: WASM hash mismatch!${NC}"
+        echo "Expected: $EXPECTED_NORMALIZED"
+        echo "Deployed: $DEPLOYED_NORMALIZED"
+        echo "This may indicate a supply chain attack or compilation issue."
+        exit 1
+    fi
+fi
+
 # Step 5: Save deployment info
 echo -e "\n${YELLOW}Step 5: Saving deployment info...${NC}"
 
@@ -191,11 +223,16 @@ cat > "$DEPLOYMENT_FILE" << EOF
   "deployed_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
   "rpc_host": "$SOROBAN_RPC_HOST",
   "network_passphrase": "$SOROBAN_NETWORK_PASSPHRASE",
-  "wasm_hash": "$(sha256sum "$WASM_FILE" | awk '{print $1}')"
+  "wasm_hash": "$EXPECTED_WASM_HASH"
 }
 EOF
 
 echo -e "${GREEN}✓ Deployment info saved to $DEPLOYMENT_FILE${NC}"
+
+# Step 5a: Store expected WASM hash for future verification
+EXPECTED_HASH_FILE="${CONTRACT_DIR}/${CONTRACT_SUBDIR}/expected_hash.txt"
+echo "$EXPECTED_WASM_HASH" > "$EXPECTED_HASH_FILE"
+echo -e "${GREEN}✓ Expected WASM hash stored to $EXPECTED_HASH_FILE${NC}"
 
 # Step 5b: Write contract ID to .deployed_ids.env for backend configuration
 DEPLOYED_IDS_FILE="${CONTRACT_DIR}/.deployed_ids.env"
@@ -212,8 +249,31 @@ fi
 
 echo -e "${GREEN}✓ Contract ID written to $DEPLOYED_IDS_FILE${NC}"
 
-# Step 6: Output Stellar Explorer link
-echo -e "\n${YELLOW}Step 6: Verification${NC}"
+# Step 6 (security — fix #336): Initialize immediately after deployment.
+# Eliminates the front-running window: anyone who calls initialize() first
+# becomes admin. We call it here so there is no manual gap.
+echo -e "\n${YELLOW}Step 6: Initializing contract (front-running prevention — fix #336)...${NC}"
+
+if [ -n "${ADMIN_ADDRESS:-}" ] && [ -n "${USDC_ADDRESS:-}" ]; then
+    $SOROBAN_CLI contract invoke \
+        --id "$CONTRACT_ID" \
+        --source "$SOROBAN_SECRET_KEY" \
+        --network "$NETWORK" \
+        -- initialize \
+        --admin "$ADMIN_ADDRESS" \
+        --usdc_address "$USDC_ADDRESS"
+    echo -e "${GREEN}✓ Contract initialized. Admin: ${ADMIN_ADDRESS}${NC}"
+else
+    echo -e "${RED}WARNING: ADMIN_ADDRESS or USDC_ADDRESS not set — contract is uninitialized!${NC}"
+    echo -e "${RED}Anyone can call initialize() and become admin. Run immediately:${NC}"
+    echo "  export ADMIN_ADDRESS=G... USDC_ADDRESS=C..."
+    echo "  $SOROBAN_CLI contract invoke --id $CONTRACT_ID --source \$SOROBAN_SECRET_KEY --network $NETWORK -- initialize --admin \$ADMIN_ADDRESS --usdc_address \$USDC_ADDRESS"
+    echo ""
+    echo -e "${RED}Do not share this contract ID until initialize() has been called.${NC}"
+fi
+
+# Step 7: Output Stellar Explorer link
+echo -e "\n${YELLOW}Step 7: Verification${NC}"
 
 if [ "$NETWORK" = "mainnet" ]; then
     EXPLORER_URL="https://stellar.expert/explorer/public/contract/$CONTRACT_ID"
@@ -232,7 +292,7 @@ echo -e "${YELLOW}Post-Deployment Checklist:${NC}"
 echo "  1. Source the deployed IDs into your backend .env:"
 echo "       cat contracts/.deployed_ids.env >> backend/.env"
 echo "     Or manually copy: ${ENV_VAR_NAME}=${CONTRACT_ID}"
-echo "  2. Call initialize() with admin address and USDC contract address"
+echo "  2. initialize() was called automatically in Step 6 (if ADMIN_ADDRESS/USDC_ADDRESS were set)"
 echo "  3. Restart the backend service to pick up the new contract ID"
 echo "  4. Verify the contract on Stellar Expert: $EXPLORER_URL"
 echo ""

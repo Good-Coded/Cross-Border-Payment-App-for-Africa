@@ -184,7 +184,10 @@ router.delete(
   removeSigner,
 );
 
-// Account data entries (manageData)
+// Account data entries (manageData) — store arbitrary key-value pairs on the Stellar account
+// GET    /api/wallet/data-entries        — list all entries
+// POST   /api/wallet/data-entry          — set/update an entry { key, value (≤64 chars) }
+// DELETE /api/wallet/data-entry/:key     — delete an entry by key
 router.get('/data-entries', listDataEntries);
 router.post('/data-entry',
   [

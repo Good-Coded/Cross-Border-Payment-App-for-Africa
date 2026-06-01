@@ -1,6 +1,24 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Send, Download, RefreshCw, Copy, CheckCheck, FlaskConical, Plus, Minus, WifiOff, Wallet, ChevronDown, PiggyBank, Eye, EyeOff, Clock } from 'lucide-react';
+import {
+  Send,
+  Download,
+  RefreshCw,
+  Copy,
+  CheckCheck,
+  FlaskConical,
+  Plus,
+  Minus,
+  WifiOff,
+  Wallet,
+  ChevronDown,
+  PiggyBank,
+  Eye,
+  EyeOff,
+  Clock,
+  Mail,
+} from 'lucide-react';
+import { Send, Download, RefreshCw, Copy, CheckCheck, FlaskConical, Plus, Minus, WifiOff, Wallet, ChevronDown, PiggyBank, Eye, EyeOff, Clock, Bell, X } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { BalanceCardSkeleton, TransactionRowSkeleton } from '../components/Skeleton';
 import api from '../utils/api';
@@ -13,6 +31,9 @@ import { setCacheEntry, getCacheEntry } from '../utils/offlineDB';
 import toast from 'react-hot-toast';
 import { useTranslation } from 'react-i18next';
 import { usePullToRefresh } from '../hooks/usePullToRefresh';
+import PINSetupModal from '../components/PINSetupModal';
+import { usePushNotifications } from '../hooks/usePushNotifications';
+import { getQueueCount } from '../utils/offlineDB';
 
 const IS_TESTNET = process.env.REACT_APP_STELLAR_NETWORK !== 'mainnet';
 const MAX_WALLETS = 5;
@@ -29,9 +50,28 @@ function BalanceDisplay({ balance }) {
 }
 
 export default function Dashboard() {
-  const { user } = useAuth();
+  const { user, updateUser } = useAuth();
   const navigate = useNavigate();
   const { t } = useTranslation();
+
+  // Issue #454: PIN setup prompt on first login
+  const [showPINSetup, setShowPINSetup] = useState(false);
+  useEffect(() => {
+    if (user && user.pin_setup_completed === false) {
+      setShowPINSetup(true);
+    }
+  }, [user]);
+
+  // Issue #455: Push notification opt-in banner
+  const { supported: pushSupported, subscribed: pushSubscribed, loading: pushLoading, subscribe: pushSubscribe } = usePushNotifications();
+  const [pushDismissed, setPushDismissed] = useState(
+    () => localStorage.getItem('afripay_push_dismissed') === 'true'
+  );
+  const showPushBanner = pushSupported && !pushSubscribed && !pushDismissed;
+  const dismissPushBanner = () => {
+    localStorage.setItem('afripay_push_dismissed', 'true');
+    setPushDismissed(true);
+  };
 
   // Admin Contract State Viewer
   const [adminContractId, setAdminContractId] = useState('');
@@ -43,7 +83,9 @@ export default function Dashboard() {
     if (!adminContractId) return;
     setAdminStateLoading(true);
     try {
-      const res = await api.get(`/contracts/${adminContractId}/state`, { params: { prefix: adminKeyPrefix } });
+      const res = await api.get(`/contracts/${adminContractId}/state`, {
+        params: { prefix: adminKeyPrefix },
+      });
       setAdminContractState(res.data.data || []);
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to fetch contract state');
@@ -76,8 +118,12 @@ export default function Dashboard() {
   const [balanceIncreased, setBalanceIncreased] = useState(false);
   const [fromCache, setFromCache] = useState(false);
   const [showZeroBalances, setShowZeroBalances] = useState(false);
+  const [queueCount, setQueueCount] = useState(0);
   const { currencies, convertFromXLM, usingApproximateRates } = useExchangeRates();
   const { isOnline } = useOnlineStatus();
+
+  // Email verification banner state (issue #479)
+  const [showEmailBanner, setShowEmailBanner] = useState(true);
 
   // Handle incoming payment from stream
   const handlePayment = useCallback(
@@ -90,17 +136,25 @@ export default function Dashboard() {
           api.get('/wallet/list'),
           api.get('/payments/history'),
           api.get('/scheduled-payments').catch(() => ({ data: { payments: [] } })),
-        ]).then(([walletsRes, txRes, scheduledRes]) => {
-          setWallets(walletsRes.data.wallets);
-          setTransactions(txRes.data.transactions.slice(0, 5));
-          setScheduledPayments((scheduledRes.data.payments || []).filter(p => p.active).slice(0, 3));
-        }).catch(() => { });
+        ])
+          .then(([walletsRes, txRes, scheduledRes]) => {
+            setWallets(walletsRes.data.wallets);
+            setTransactions(txRes.data.transactions.slice(0, 5));
+            setScheduledPayments(
+              (scheduledRes.data.payments || []).filter((p) => p.active).slice(0, 3)
+            );
+          })
+          .catch(() => {});
       }
     },
-    [wallet?.public_key],
+    [wallet?.public_key]
   );
 
-  const { isConnected, isReconnecting, error: streamError } = usePaymentStream(wallet?.public_key, handlePayment);
+  const {
+    isConnected,
+    isReconnecting,
+    error: streamError,
+  } = usePaymentStream(wallet?.public_key, handlePayment);
 
   const loadDashboard = useCallback(async (isRefresh = false) => {
     // Initial load shows full skeleton; manual refresh shows spinner on button only
@@ -145,14 +199,11 @@ export default function Dashboard() {
       setWallets(walletsData);
       setActiveWalletId((id) => id || walletsData[0]?.id || null);
       setTransactions(txData.slice(0, 5));
-      setScheduledPayments((scheduledRes.data.payments || []).filter(p => p.active).slice(0, 3));
+      setScheduledPayments((scheduledRes.data.payments || []).filter((p) => p.active).slice(0, 3));
       setScheduledLoading(false);
       setFromCache(false);
 
-      await Promise.all([
-        setCacheEntry('wallets', walletsData),
-        setCacheEntry('history', txData),
-      ]);
+      await Promise.all([setCacheEntry('wallets', walletsData), setCacheEntry('history', txData)]);
     } catch {
       try {
         const [cachedWallets, cachedHistory] = await Promise.all([
@@ -179,7 +230,12 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadDashboard();
-  }, [loadDashboard]);
+    if (!isOnline) {
+      getQueueCount()
+        .then(setQueueCount)
+        .catch(() => {});
+    }
+  }, [loadDashboard, isOnline]);
 
   const copyAddress = () => {
     navigator.clipboard.writeText(wallet?.public_key || '');
@@ -241,7 +297,8 @@ export default function Dashboard() {
   const xlmBalance = wallet?.balances?.find((b) => b.asset === 'XLM')?.balance ?? '0';
   const xlmAvailable = wallet?.balances?.find((b) => b.asset === 'XLM')?.available_balance ?? null;
   const accountExists = wallet?.account_exists !== false; // treat undefined (cached) as true
-  const showFundWalletButton = IS_TESTNET && !!wallet && (xlmBalance === '0' || wallet.account_exists === false);
+  const showFundWalletButton =
+    IS_TESTNET && !!wallet && (xlmBalance === '0' || wallet.account_exists === false);
 
   // All non-zero balances for the active wallet
   const allBalances = wallet?.balances || [];
@@ -257,29 +314,15 @@ export default function Dashboard() {
       ? selectedAssetBalance
       : convertFromXLM(xlmBalance, selectedCurrency);
 
-  const { pullDistance, refreshing, onTouchStart, onTouchMove, onTouchEnd } = usePullToRefresh(loadDashboard);
+  const {
+    pullDistance,
+    refreshing: pullRefreshing,
+    onTouchStart,
+    onTouchMove,
+    onTouchEnd,
+  } = usePullToRefresh(loadDashboard);
 
-  if (loading)
-    return (
-      <div className="px-4 py-6 max-w-lg mx-auto space-y-6" aria-busy="true" aria-label="Loading dashboard">
-        <div className="flex items-center justify-between">
-          <div className="space-y-2">
-            <div className="skeleton h-3 w-20 rounded-lg" />
-            <div className="skeleton h-5 w-32 rounded-lg" />
-          </div>
-        </div>
-        <BalanceCardSkeleton />
-        <div className="grid grid-cols-2 gap-3">
-          <div className="skeleton h-16 rounded-xl" />
-          <div className="skeleton h-16 rounded-xl" />
-        </div>
-        <div className="space-y-2">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <TransactionRowSkeleton key={i} />
-          ))}
-        </div>
-      </div>
-    );
+  // Removed global loading block to allow granular skeleton loading
 
   return (
     <div
@@ -289,15 +332,17 @@ export default function Dashboard() {
       onTouchEnd={onTouchEnd}
     >
       {/* Pull-to-refresh indicator */}
-      {(pullDistance > 0 || refreshing) && (
+      {(pullDistance > 0 || pullRefreshing) && (
         <div
           className="flex justify-center items-center transition-all duration-150"
-          style={{ height: refreshing ? 40 : pullDistance, overflow: 'hidden' }}
+          style={{ height: pullRefreshing ? 40 : pullDistance, overflow: 'hidden' }}
         >
           <RefreshCw
             size={20}
-            className={`text-primary-400 transition-transform ${refreshing ? 'animate-spin' : ''}`}
-            style={{ transform: refreshing ? undefined : `rotate(${(pullDistance / 80) * 360}deg)` }}
+            className={`text-primary-400 transition-transform ${pullRefreshing ? 'animate-spin' : ''}`}
+            style={{
+              transform: pullRefreshing ? undefined : `rotate(${(pullDistance / 80) * 360}deg)`,
+            }}
           />
         </div>
       )}
@@ -317,6 +362,22 @@ export default function Dashboard() {
               {funding ? 'Funding…' : 'Fund wallet'}
             </button>
           )}
+        </div>
+      )}
+
+      {/* Email verification banner (issue #479) */}
+      {showEmailBanner && user?.email_verified === false && (
+        <div className="flex items-center justify-between bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3">
+          <div className="flex items-center gap-2 text-blue-400 text-sm">
+            <Mail size={15} />
+            <span>Please verify your email address to unlock full account features</span>
+          </div>
+          <button
+            onClick={() => setShowEmailBanner(false)}
+            className="text-blue-400 hover:text-blue-300 text-xs font-semibold px-2 py-1 rounded-lg transition-colors"
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -358,6 +419,45 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* Issue #455: Push notification opt-in banner */}
+      {showPushBanner && (
+        <div className="flex items-center gap-3 bg-primary-500/10 border border-primary-500/30 rounded-xl px-4 py-3">
+          <Bell size={18} className="text-primary-400 shrink-0" />
+          <div className="flex-1">
+            <p className="text-primary-300 text-sm font-medium">Enable push notifications</p>
+            <p className="text-primary-400/70 text-xs mt-0.5">
+              Get alerted instantly when you receive a payment.
+            </p>
+          </div>
+          <button
+            onClick={pushSubscribe}
+            disabled={pushLoading}
+            className="text-xs bg-primary-500 hover:bg-primary-600 disabled:opacity-50 text-white font-semibold px-3 py-1.5 rounded-lg transition-colors shrink-0"
+          >
+            {pushLoading ? 'Enabling…' : 'Enable'}
+          </button>
+          <button
+            onClick={dismissPushBanner}
+            className="text-gray-500 hover:text-white shrink-0"
+            aria-label="Dismiss notification prompt"
+          >
+            <X size={16} />
+          </button>
+      {/* Offline Queue Indicator */}
+      {!isOnline && queueCount > 0 && (
+        <div className="flex items-center justify-between bg-primary-500/10 border border-primary-500/30 rounded-xl px-4 py-3">
+          <div className="flex items-center gap-3 text-primary-400 text-sm">
+            <Clock size={16} />
+            <span>
+              {queueCount} payment{queueCount !== 1 ? 's' : ''} queued offline
+            </span>
+          </div>
+          <p className="text-[10px] text-primary-500/70 font-medium uppercase tracking-wider">
+            Pending Sync
+          </p>
+        </div>
+      )}
+
       {/* Greeting */}
       <div className="flex items-center justify-between">
         <div>
@@ -373,22 +473,22 @@ export default function Dashboard() {
               isReconnecting
                 ? 'Live updates: reconnecting'
                 : isConnected
-                ? 'Live updates: connected'
-                : 'Live updates: disconnected'
+                  ? 'Live updates: connected'
+                  : 'Live updates: disconnected'
             }
             title={
               isReconnecting
                 ? 'Reconnecting to live updates…'
                 : isConnected
-                ? 'Live updates active'
-                : 'Live updates paused'
+                  ? 'Live updates active'
+                  : 'Live updates paused'
             }
             className={`w-2.5 h-2.5 rounded-full shrink-0 ${
               isReconnecting
                 ? 'bg-orange-400 animate-pulse'
                 : isConnected
-                ? 'bg-green-400'
-                : 'bg-red-400'
+                  ? 'bg-green-400'
+                  : 'bg-red-400'
             }`}
           />
           <button
@@ -440,20 +540,21 @@ export default function Dashboard() {
                     setActiveWalletId(w.id);
                     setShowWalletDropdown(false);
                   }}
-                  className={`w-full flex items-center justify-between px-4 py-3 text-left transition-colors ${w.id === activeWalletId
+                  className={`w-full flex items-center justify-between px-4 py-3 text-left transition-colors ${
+                    w.id === activeWalletId
                       ? 'bg-primary-500/20 text-primary-400'
                       : 'hover:bg-gray-700 text-white'
-                    }`}
+                  }`}
                 >
                   <div>
                     <p className="font-medium text-sm">{w.label}</p>
-                    <p className="text-xs text-gray-500 font-mono">{truncateAddress(w.public_key, 8)}</p>
+                    <p className="text-xs text-gray-500 font-mono">
+                      {truncateAddress(w.public_key, 8)}
+                    </p>
                   </div>
                   <div className="text-right">
                     <p className="text-sm font-semibold">{parseFloat(xlm).toLocaleString()} XLM</p>
-                    {w.is_default && (
-                      <p className="text-xs text-primary-400">Default</p>
-                    )}
+                    {w.is_default && <p className="text-xs text-primary-400">Default</p>}
                   </div>
                 </button>
               );
@@ -482,7 +583,10 @@ export default function Dashboard() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => { setShowCreateForm(false); setNewWalletLabel(''); }}
+                      onClick={() => {
+                        setShowCreateForm(false);
+                        setNewWalletLabel('');
+                      }}
                       className="text-gray-400 hover:text-white text-sm px-2 py-2 rounded-lg transition-colors"
                     >
                       ✕
@@ -509,71 +613,110 @@ export default function Dashboard() {
       </div>
 
       {/* Balance Card */}
-      <div
-        className={`bg-gradient-to-br from-primary-600 to-primary-700 rounded-2xl p-5 shadow-lg shadow-primary-500/20 transition-all duration-500 ${balanceIncreased ? 'ring-4 ring-green-400 ring-opacity-50' : ''
+      {loading ? (
+        <BalanceCardSkeleton />
+      ) : (
+        <div
+          className={`bg-gradient-to-br from-primary-600 to-primary-700 rounded-2xl p-5 shadow-lg shadow-primary-500/20 transition-all duration-500 ${
+            balanceIncreased ? 'ring-4 ring-green-400 ring-opacity-50' : ''
           }`}
-      >
-        <div className="flex items-center justify-between mb-1">
-          <p className="text-primary-100 text-sm">{t('dashboard.total_balance')}</p>
-          {fromCache && (
-            <span className="flex items-center gap-1 text-primary-200 text-xs bg-primary-800/40 rounded-full px-2 py-0.5">
-              <WifiOff size={10} aria-hidden="true" />
-              Cached
-            </span>
-          )}
-        </div>
-
-        {/* Primary display: selected asset balance */}
-        <div className="flex items-end gap-2 mb-2">
-          <BalanceDisplay balance={parseFloat(displayBalance)} />
-          <span className="text-primary-200 mb-1">{selectedCurrency}</span>
-        </div>
-        {xlmAvailable !== null && selectedCurrency === 'XLM' && (
-          <p className="text-primary-200 text-xs mb-2">
-            Available to send: {parseFloat(xlmAvailable).toLocaleString()} XLM
-          </p>
-        )}
-
-        {/* All asset balances */}
-        {visibleBalances.length > 0 && (
-          <div className="mb-3 space-y-1">
-            {visibleBalances.map((b) => {
-              const assetMeta = currencies.find((c) => c.code === b.asset);
-              const flag = assetMeta?.flag ?? '🪙';
-              const isSelected = b.asset === selectedCurrency;
-              return (
-                <button
-                  key={b.asset}
-                  onClick={() => setSelectedCurrency(b.asset)}
-                  className={`w-full flex items-center justify-between rounded-lg px-3 py-1.5 transition-colors text-sm ${
-                    isSelected
-                      ? 'bg-white/20 text-white font-semibold'
-                      : 'bg-primary-800/30 text-primary-100 hover:bg-primary-800/50'
-                  }`}
-                  aria-pressed={isSelected}
-                >
-                  <span>{flag} {b.asset}</span>
-                  <span>{parseFloat(b.balance).toLocaleString()}</span>
-                </button>
-              );
-            })}
+        >
+          <div className="flex items-center justify-between mb-1">
+            <p className="text-primary-100 text-sm">{t('dashboard.total_balance')}</p>
+            {fromCache && (
+              <span className="flex items-center gap-1 text-primary-200 text-xs bg-primary-800/40 rounded-full px-2 py-0.5">
+                <WifiOff size={10} aria-hidden="true" />
+                Cached
+              </span>
+            )}
           </div>
-        )}
 
-        {/* Show all / hide zero-balance toggle */}
-        {allBalances.some((b) => parseFloat(b.balance) === 0) && (
-          <button
-            onClick={() => setShowZeroBalances((v) => !v)}
-            className="flex items-center gap-1 text-primary-200 text-xs mb-3 hover:text-white transition-colors"
-          >
-            {showZeroBalances ? <EyeOff size={12} /> : <Eye size={12} />}
-            {showZeroBalances ? 'Hide zero balances' : 'Show all assets'}
-          </button>
-        )}
+          {/* Primary display: selected asset balance */}
+          <div className="flex items-end gap-2 mb-2">
+            <BalanceDisplay balance={parseFloat(displayBalance)} />
+            <span className="text-primary-200 mb-1">{selectedCurrency}</span>
+          </div>
+          {xlmAvailable !== null && selectedCurrency === 'XLM' && (
+            <p className="text-primary-200 text-xs mb-2">
+              Available to send: {parseFloat(xlmAvailable).toLocaleString()} XLM
+            </p>
+          )}
 
+          {/* All asset balances */}
+          {visibleBalances.length > 0 && (
+            <div className="mb-3 space-y-1">
+              {visibleBalances.map((b) => {
+                const assetMeta = currencies.find((c) => c.code === b.asset);
+                const flag = assetMeta?.flag ?? '🪙';
+                const isSelected = b.asset === selectedCurrency;
+                return (
+                  <button
+                    key={b.asset}
+                    onClick={() => setSelectedCurrency(b.asset)}
+                    className={`w-full flex items-center justify-between rounded-lg px-3 py-1.5 transition-colors text-sm ${
+                      isSelected
+                        ? 'bg-white/20 text-white font-semibold'
+                        : 'bg-primary-800/30 text-primary-100 hover:bg-primary-800/50'
+                    }`}
+                    aria-pressed={isSelected}
+                  >
+                    <span>
+                      {flag} {b.asset}
+                    </span>
+                    <span>{parseFloat(b.balance).toLocaleString()}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Show all / hide zero-balance toggle */}
+          {allBalances.some((b) => parseFloat(b.balance) === 0) && (
+            <button
+              onClick={() => setShowZeroBalances((v) => !v)}
+              className="flex items-center gap-1 text-primary-200 text-xs mb-3 hover:text-white transition-colors"
+            >
+              {showZeroBalances ? <EyeOff size={12} /> : <Eye size={12} />}
+              {showZeroBalances ? 'Hide zero balances' : 'Show all assets'}
+            </button>
+          )}
+
+          {/* Fiat currency selector */}
+          <div className="flex gap-2 flex-wrap mb-3">
+            {currencies
+              .filter((c) => c.code !== 'XLM')
+              .map((c) => (
+                <button
+                  key={c.code}
+                  onClick={() => setSelectedCurrency(c.code)}
+                  className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
+                    selectedCurrency === c.code
+                      ? 'bg-white text-primary-700 font-semibold'
+                      : 'bg-primary-500/40 text-primary-100 hover:bg-primary-500/60'
+                  }`}
+                >
+                  {c.flag} {c.code}
+                </button>
+              ))}
+          </div>
+          {usingApproximateRates && (
+            <p className="text-primary-200/90 text-xs mb-3 leading-snug">
+              {t('common.rates_disclaimer')}
+            </p>
+          )}
+
+          {/* Wallet address */}
+          <div className="flex items-center gap-2 bg-primary-800/40 rounded-lg px-3 py-2">
+            <span className="text-primary-200 text-xs font-mono flex-1 truncate">
+              {truncateAddress(wallet?.public_key, 10)}
+            </span>
+            <button
+              onClick={copyAddress}
+              className="text-primary-200 hover:text-white shrink-0"
+              aria-label={copied ? 'Address copied' : 'Copy wallet address'}
         {/* Fiat currency selector */}
         <div className="flex gap-2 flex-wrap mb-3">
-          {currencies.filter((c) => c.code !== 'XLM').map((c) => (
+          {currencies.map((c) => (
             <button
               key={c.code}
               onClick={() => setSelectedCurrency(c.code)}
@@ -581,9 +724,11 @@ export default function Dashboard() {
                   ? 'bg-white text-primary-700 font-semibold'
                   : 'bg-primary-500/40 text-primary-100 hover:bg-primary-500/60'
                 }`}
+              title={`View balance in ${c.name}`}
             >
-              {c.flag} {c.code}
+              {copied ? <CheckCheck size={14} /> : <Copy size={14} />}
             </button>
+          </div>
           ))}
         </div>
         {usingApproximateRates && (
@@ -599,13 +744,14 @@ export default function Dashboard() {
           </span>
           <button
             onClick={copyAddress}
-            className="text-primary-200 hover:text-white shrink-0"
-            aria-label={copied ? 'Address copied' : 'Copy wallet address'}
+            className="text-primary-200 hover:text-white shrink-0 transition-colors"
+            aria-label={copied ? 'Address copied to clipboard' : 'Copy wallet address'}
+            title={copied ? 'Copied!' : 'Copy address'}
           >
-            {copied ? <CheckCheck size={14} /> : <Copy size={14} />}
+            {copied ? <CheckCheck size={14} className="text-green-400" /> : <Copy size={14} />}
           </button>
         </div>
-      </div>
+      )}
 
       {/* All wallets balance summary (when user has more than one) */}
       {wallets.length > 1 && (
@@ -619,12 +765,17 @@ export default function Dashboard() {
                 <button
                   key={w.id}
                   onClick={() => setActiveWalletId(w.id)}
-                  className={`w-full flex items-center justify-between rounded-lg px-3 py-2 transition-colors ${isActive ? 'bg-primary-500/10 border border-primary-500/30' : 'hover:bg-gray-800'
-                    }`}
+                  className={`w-full flex items-center justify-between rounded-lg px-3 py-2 transition-colors ${
+                    isActive
+                      ? 'bg-primary-500/10 border border-primary-500/30'
+                      : 'hover:bg-gray-800'
+                  }`}
                 >
                   <div className="flex items-center gap-2">
                     <Wallet size={14} className={isActive ? 'text-primary-400' : 'text-gray-500'} />
-                    <span className={`text-sm ${isActive ? 'text-primary-400 font-medium' : 'text-gray-300'}`}>
+                    <span
+                      className={`text-sm ${isActive ? 'text-primary-400 font-medium' : 'text-gray-300'}`}
+                    >
                       {w.label}
                     </span>
                   </div>
@@ -668,9 +819,11 @@ export default function Dashboard() {
           className="bg-green-500/10 hover:bg-green-500/20 disabled:opacity-50 border border-green-500/30 rounded-xl p-4 flex items-center gap-3 shadow-sm transition-all"
         >
           <div className="w-10 h-10 bg-green-500/20 rounded-lg flex items-center justify-center text-green-500">
-            {anchorLoading && anchorAction === 'deposit'
-              ? <div className="w-5 h-5 border-2 border-green-500 border-t-transparent rounded-full animate-spin" />
-              : <Plus size={20} />}
+            {anchorLoading && anchorAction === 'deposit' ? (
+              <div className="w-5 h-5 border-2 border-green-500 border-t-transparent rounded-full animate-spin" />
+            ) : (
+              <Plus size={20} />
+            )}
           </div>
           <span className="font-semibold text-green-600 dark:text-green-400">
             {t('dashboard.add_money') || 'Add Money'}
@@ -682,9 +835,11 @@ export default function Dashboard() {
           className="bg-blue-500/10 hover:bg-blue-500/20 disabled:opacity-50 border border-blue-500/30 rounded-xl p-4 flex items-center gap-3 shadow-sm transition-all"
         >
           <div className="w-10 h-10 bg-blue-500/20 rounded-lg flex items-center justify-center text-blue-500">
-            {anchorLoading && anchorAction === 'withdraw'
-              ? <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              : <Minus size={20} />}
+            {anchorLoading && anchorAction === 'withdraw' ? (
+              <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+            ) : (
+              <Minus size={20} />
+            )}
           </div>
           <span className="font-semibold text-blue-600 dark:text-blue-400">
             {t('dashboard.withdraw') || 'Withdraw'}
@@ -695,20 +850,22 @@ export default function Dashboard() {
       {/* Admin Dashboard: Contract State Viewer */}
       {user?.role === 'admin' && (
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <h3 className="text-sm font-semibold text-primary-400 mb-3">Admin: Contract State Viewer</h3>
+          <h3 className="text-sm font-semibold text-primary-400 mb-3">
+            Admin: Contract State Viewer
+          </h3>
           <div className="flex gap-2 flex-wrap mb-3">
             <input
               type="text"
               placeholder="Contract ID (C...)"
               value={adminContractId}
-              onChange={e => setAdminContractId(e.target.value)}
+              onChange={(e) => setAdminContractId(e.target.value)}
               className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-500 focus:outline-none focus:border-primary-500 transition-colors"
             />
             <input
               type="text"
               placeholder="Key Prefix (optional)"
               value={adminKeyPrefix}
-              onChange={e => setAdminKeyPrefix(e.target.value)}
+              onChange={(e) => setAdminKeyPrefix(e.target.value)}
               className="w-32 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-500 focus:outline-none focus:border-primary-500 transition-colors"
             />
             <button
@@ -733,17 +890,22 @@ export default function Dashboard() {
         <div>
           <div className="flex items-center justify-between mb-3">
             <h3 className="font-semibold text-gray-900 dark:text-white">Upcoming Payments</h3>
-            <button onClick={() => navigate('/scheduled')} className="text-primary-500 text-sm hover:underline">
+            <button
+              onClick={() => navigate('/scheduled')}
+              className="text-primary-500 text-sm hover:underline"
+            >
               See all
             </button>
           </div>
           {scheduledLoading ? (
             <div className="space-y-2">
-              {[0, 1].map(i => <div key={i} className="skeleton h-14 rounded-xl" />)}
+              {[0, 1].map((i) => (
+                <div key={i} className="skeleton h-14 rounded-xl" />
+              ))}
             </div>
           ) : (
             <div className="space-y-2">
-              {scheduledPayments.map(p => (
+              {scheduledPayments.map((p) => (
                 <div
                   key={p.id}
                   className="bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-xl p-3 flex items-center gap-3 shadow-sm"
@@ -769,11 +931,23 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* Issue #454: PIN setup modal on first login */}
+      <PINSetupModal
+        isOpen={showPINSetup}
+        onClose={() => setShowPINSetup(false)}
+        onSuccess={() => updateUser({ pin_setup_completed: true })}
+      />
+
       {/* Recent transactions */}
       <div>
         <div className="flex items-center justify-between mb-3">
-          <h3 className="font-semibold text-gray-900 dark:text-white">{t('dashboard.recent_activity')}</h3>
-          <button onClick={() => navigate('/history')} className="text-primary-500 text-sm hover:underline">
+          <h3 className="font-semibold text-gray-900 dark:text-white">
+            {t('dashboard.recent_activity')}
+          </h3>
+          <button
+            onClick={() => navigate('/history')}
+            className="text-primary-500 text-sm hover:underline"
+          >
             {t('common.see_all')}
           </button>
         </div>
@@ -790,10 +964,11 @@ export default function Dashboard() {
                 className="bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-xl p-3 flex items-center gap-3 shadow-sm"
               >
                 <div
-                  className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${tx.direction === 'sent'
+                  className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${
+                    tx.direction === 'sent'
                       ? 'bg-red-500/10 text-red-400'
                       : 'bg-primary-500/10 text-primary-400'
-                    }`}
+                  }`}
                 >
                   {tx.direction === 'sent' ? <Send size={16} /> : <Download size={16} />}
                 </div>
@@ -804,22 +979,30 @@ export default function Dashboard() {
                       : `${t('dashboard.from')} ${truncateAddress(tx.sender_wallet)}`}
                   </p>
                   <div className="flex items-center gap-2 mt-0.5">
-                    <p className="text-xs text-gray-500">{new Date(tx.created_at).toLocaleDateString()}</p>
+                    <p className="text-xs text-gray-500">
+                      {new Date(tx.created_at).toLocaleDateString()}
+                    </p>
                     {tx.status && tx.status !== 'completed' && (
-                      <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${
-                        tx.status === 'pending'   ? 'bg-yellow-500/10 text-yellow-400' :
-                        tx.status === 'failed'    ? 'bg-red-500/10 text-red-400' :
-                        tx.status === 'cancelled' ? 'bg-gray-500/10 text-gray-400' :
-                                                    'bg-blue-500/10 text-blue-400'
-                      }`}>
+                      <span
+                        className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${
+                          tx.status === 'pending'
+                            ? 'bg-yellow-500/10 text-yellow-400'
+                            : tx.status === 'failed'
+                              ? 'bg-red-500/10 text-red-400'
+                              : tx.status === 'cancelled'
+                                ? 'bg-gray-500/10 text-gray-400'
+                                : 'bg-blue-500/10 text-blue-400'
+                        }`}
+                      >
                         {tx.status}
                       </span>
                     )}
                   </div>
                 </div>
                 <span
-                  className={`text-sm font-semibold shrink-0 ${tx.direction === 'sent' ? 'text-red-400' : 'text-primary-400'
-                    }`}
+                  className={`text-sm font-semibold shrink-0 ${
+                    tx.direction === 'sent' ? 'text-red-400' : 'text-primary-400'
+                  }`}
                 >
                   {tx.direction === 'sent' ? '-' : '+'}
                   {tx.amount} {tx.asset}

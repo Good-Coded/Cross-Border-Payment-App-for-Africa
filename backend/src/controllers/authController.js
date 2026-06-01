@@ -6,10 +6,8 @@ const { createWallet, encryptPrivateKey, addTrustline } = require('../services/s
 const audit = require('../services/audit');
 const logger = require('../utils/logger');
 const { hashPIN, comparePIN, validatePIN } = require('../services/pin');
-const { sendVerificationEmail } = require('../services/email');
-const logger = require('../utils/logger');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email');
-const { generateSecret, verifyToken, generateBackupCodes, useBackupCode } = require('../services/twofa');
+const { generateSecret, verifyToken, generateBackupCodes } = require('../services/twofa');
 const {
   COOKIE_NAME,
   COOKIE_OPTIONS,
@@ -19,11 +17,9 @@ const {
 } = require('../utils/tokens');
 const { setCsrfCookie } = require('../middleware/csrf');
 
-const TOKEN_TTL_MS = 96 * 60 * 60 * 1000; // 96 hours
 const { sendOTP } = require('../services/sms');
 const { recordSession } = require('./sessionController');
 
-const TOKEN_TTL_MS = 96 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 const PHONE_OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -170,7 +166,9 @@ async function login(req, res, next) {
     const { email, password, totp_code } = req.body;
 
     const result = await db.query(
-      `SELECT u.id, u.full_name, u.email, u.password_hash, u.email_verified, u.role, u.totp_enabled, u.totp_secret, u.failed_login_attempts, u.locked_until, u.last_failed_attempt_at, w.public_key
+      `SELECT u.id, u.full_name, u.email, u.password_hash, u.email_verified, u.role,
+              u.totp_enabled, u.totp_secret, u.failed_login_attempts, u.locked_until,
+              u.last_failed_attempt_at, w.public_key
        FROM users u LEFT JOIN wallets w ON w.user_id = u.id
        WHERE u.email = $1`,
       [email]
@@ -191,8 +189,7 @@ async function login(req, res, next) {
           locked_until: lockUntil.toISOString(),
         });
       }
-
-      // Lock has expired, reset attempt counters
+      // Lock has expired — reset counters
       await db.query(
         `UPDATE users SET failed_login_attempts = 0, locked_until = NULL, last_failed_attempt_at = NULL WHERE id = $1`,
         [user.id]
@@ -205,29 +202,21 @@ async function login(req, res, next) {
     // Verify password
     const isValidPassword = user && (await bcrypt.compare(password, user.password_hash));
     if (!user || !isValidPassword) {
-      // Invalid credentials - increment failed attempts for existing users
       if (user) {
         const lastAttempt = user.last_failed_attempt_at ? new Date(user.last_failed_attempt_at) : null;
-        const now = new Date();
         const ATTEMPT_WINDOW_MS = ATTEMPT_WINDOW_MINUTES * 60 * 1000;
-
         let failedAttempts = user.failed_login_attempts || 0;
 
-        // If the last attempt was outside the 15-minute window, reset the counter
         if (lastAttempt && (now - lastAttempt) > ATTEMPT_WINDOW_MS) {
           failedAttempts = 0;
         }
-
-        // Increment failed attempts
         failedAttempts++;
-        const nowTimestamp = now;
 
-        // Check if we should lock the account
         if (failedAttempts >= MAX_FAILED_ATTEMPTS) {
-          const lockedUntil = new Date(now + (LOCKOUT_DURATION_MINUTES * 60 * 1000));
+          const lockedUntil = new Date(now.getTime() + LOCKOUT_DURATION_MINUTES * 60 * 1000);
           await db.query(
             `UPDATE users SET failed_login_attempts = $1, locked_until = $2, last_failed_attempt_at = $3 WHERE id = $4`,
-            [failedAttempts, lockedUntil, nowTimestamp, user.id]
+            [failedAttempts, lockedUntil, now, user.id]
           );
           audit.log(user.id, 'account_locked', req.ip, req.headers['user-agent'], {
             reason: 'excessive_failed_login_attempts',
@@ -240,56 +229,41 @@ async function login(req, res, next) {
           });
         }
 
-        // Update attempt counter and timestamp
         await db.query(
           `UPDATE users SET failed_login_attempts = $1, last_failed_attempt_at = $2 WHERE id = $3`,
-          [failedAttempts, nowTimestamp, user.id]
+          [failedAttempts, now, user.id]
         );
         audit.log(user.id, 'login_failure', req.ip, req.headers['user-agent'], {
           failed_attempts: failedAttempts,
           attempts_remaining: MAX_FAILED_ATTEMPTS - failedAttempts,
         });
       }
-
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    // Password is valid
     if (!user.email_verified) {
       return res.status(403).json({ error: 'Please verify your email before logging in.' });
     }
 
     // Short-lived access token
-    const token = signAccessToken({ userId: user.id, email: user.email, role: user.role });
-
-    // Refresh token — store only the hash, seed a new family
-    const { raw, hash } = generateRefreshToken();
-    const familyId = uuidv4();
-    await db.query(
-      `INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, revoked, expires_at)
-       VALUES ($1, $2, $3, $4, FALSE, $5)`,
-      [uuidv4(), user.id, hash, familyId, refreshTokenExpiresAt()]
-    );
-
-    res.cookie(COOKIE_NAME, raw, COOKIE_OPTIONS);
-    // Check if 2FA is enabled
+    // 2FA check — must happen before issuing tokens
     if (user.totp_enabled) {
       if (!totp_code) {
         return res.status(403).json({ error: 'TOTP code required', requires_2fa: true });
       }
-
       const isValid = verifyToken(user.totp_secret, totp_code);
       if (!isValid) {
         return res.status(401).json({ error: 'Invalid TOTP code' });
       }
     }
 
-    // Successful login - reset attempt counters
+    // Successful login — reset attempt counters
     await db.query(
       `UPDATE users SET failed_login_attempts = 0, locked_until = NULL, last_failed_attempt_at = NULL WHERE id = $1`,
       [user.id]
     );
 
+    // Issue short-lived access token
     const token = signAccessToken({ userId: user.id, email: user.email, role: user.role });
 
     // Issue refresh token — store only the hash in DB, seed a new family
@@ -319,70 +293,6 @@ async function login(req, res, next) {
         phone_verified: user.phone_verified,
       },
     });
-  } catch (err) {
-    next(err);
-  }
-}
-
-async function refresh(req, res, next) {
-  try {
-    const raw = req.cookies?.[COOKIE_NAME];
-    if (!raw) return res.status(401).json({ error: 'No refresh token' });
-
-    const hash = crypto.createHash('sha256').update(raw).digest('hex');
-
-    // Look up the token (active or revoked — we need both cases)
-    const result = await db.query(
-      `SELECT rt.id, rt.user_id, rt.expires_at, rt.family_id, rt.revoked,
-              u.email, u.role
-       FROM refresh_tokens rt
-       JOIN users u ON u.id = rt.user_id
-       WHERE rt.token_hash = $1`,
-      [hash]
-    );
-
-    const record = result.rows[0];
-
-    if (!record) {
-      // Hash not in DB at all — could be a completely bogus token, or a token
-      // from a family that was already fully wiped by a prior reuse detection.
-      return res.status(401).json({ error: 'Invalid refresh token' });
-    }
-
-    if (record.revoked) {
-      // Token was already rotated — this is a reuse attack.
-      // Invalidate the entire family and force re-login.
-      await db.query('DELETE FROM refresh_tokens WHERE family_id = $1', [record.family_id]);
-      logger.warn('refresh_token_reuse detected — family invalidated', {
-        event:     'refresh_token_reuse',
-        family_id: record.family_id,
-        user_id:   record.user_id,
-      });
-      res.clearCookie(COOKIE_NAME, { ...COOKIE_OPTIONS, maxAge: undefined });
-      return res.status(401).json({ error: 'Refresh token reuse detected. Please log in again.' });
-    }
-
-    if (new Date(record.expires_at) < new Date()) {
-      await db.query('DELETE FROM refresh_tokens WHERE id = $1', [record.id]);
-      res.clearCookie(COOKIE_NAME, { ...COOKIE_OPTIONS, maxAge: undefined });
-      return res.status(401).json({ error: 'Refresh token expired' });
-    }
-
-    // Valid — rotate: mark old token revoked (kept for reuse detection), issue new one
-    const { raw: newRaw, hash: newHash } = generateRefreshToken();
-
-    await db.query('UPDATE refresh_tokens SET revoked = TRUE WHERE id = $1', [record.id]);
-    await db.query(
-      `INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, revoked, expires_at)
-       VALUES ($1, $2, $3, $4, FALSE, $5)`,
-      [uuidv4(), record.user_id, newHash, record.family_id, refreshTokenExpiresAt()]
-    );
-
-    const token = signAccessToken({ userId: record.user_id, email: record.email, role: record.role });
-
-    res.cookie(COOKIE_NAME, newRaw, COOKIE_OPTIONS);
-    setCsrfCookie(res);
-    res.json({ token });
   } catch (err) {
     next(err);
   }
@@ -476,7 +386,7 @@ async function verifyPhone(req, res, next) {
 async function getMe(req, res, next) {
   try {
     const result = await db.query(
-      `SELECT u.id, u.full_name, u.email, u.phone, u.phone_verified, u.pin_setup_completed, u.totp_enabled, u.account_type, w.public_key
+      `SELECT u.id, u.full_name, u.email, u.email_verified, u.phone, u.phone_verified, u.pin_setup_completed, u.totp_enabled, u.account_type, w.public_key
        FROM users u LEFT JOIN wallets w ON w.user_id = u.id
        WHERE u.id = $1`,
       [req.user.userId]
@@ -487,6 +397,7 @@ async function getMe(req, res, next) {
       id: u.id,
       full_name: u.full_name,
       email: u.email,
+      email_verified: u.email_verified,
       phone: u.phone,
       phone_verified: u.phone_verified,
       wallet_address: u.public_key,
@@ -604,12 +515,6 @@ async function verifyPIN(req, res, next) {
 
     const { pin_hash } = result.rows[0];
 
-    if (!result.rows[0]) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    const { pin_hash } = result.rows[0];
-
     if (!pin_hash) {
       return res.status(400).json({ error: 'PIN not configured. Please set up a PIN first.' });
     }
@@ -623,7 +528,6 @@ async function verifyPIN(req, res, next) {
   }
 }
 
-module.exports = { register, login, refresh, logout, verifyEmail, getMe, setPIN, verifyPIN };
 async function refresh(req, res, next) {
   try {
     const raw = req.cookies?.[COOKIE_NAME];
@@ -723,19 +627,6 @@ async function refresh(req, res, next) {
   }
 }
 
-async function logout(req, res, next) {
-  try {
-    const raw = req.cookies?.[COOKIE_NAME];
-    if (raw) {
-      const hash = crypto.createHash('sha256').update(raw).digest('hex');
-      await db.query('DELETE FROM refresh_tokens WHERE token_hash = $1', [hash]);
-    }
-    res.clearCookie(COOKIE_NAME, { ...COOKIE_OPTIONS, maxAge: undefined });
-    res.json({ message: 'Logged out successfully' });
-  } catch (err) {
-    next(err);
-  }
-}
 
 async function forgotPassword(req, res, next) {
   try {
@@ -926,6 +817,7 @@ async function getActivity(req, res, next) {
   }
 }
 
+module.exports = { register, login, verifyEmail, getMe, setPIN, verifyPIN };
 module.exports = {
   register,
   login,
