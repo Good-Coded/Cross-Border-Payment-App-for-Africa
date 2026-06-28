@@ -261,3 +261,25 @@ fn test_accrue_interest_non_admin_panics() {
     env.ledger().with_mut(|li| li.timestamp += 86400);
     client.accrue_interest(&impostor, &user);
 }
+
+#[test]
+fn test_two_depositors_independent() {
+    let (env, client, admin, usdc_id) = setup();
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let amount1 = 1_000_0000000i128;
+    let amount2 = 500_0000000i128;
+    let unlock_time1 = env.ledger().timestamp() + 3600;
+    let unlock_time2 = env.ledger().timestamp() + 7200;
+
+    mint_usdc(&env, &usdc_id, &admin, &user1, amount1);
+    mint_usdc(&env, &usdc_id, &admin, &user2, amount2);
+
+    client.deposit(&user1, &amount1, &unlock_time1);
+    client.deposit(&user2, &amount2, &unlock_time2);
+
+    assert_eq!(client.get_balance(&user1), amount1);
+    assert_eq!(client.get_unlock_time(&user1), unlock_time1);
+    assert_eq!(client.get_balance(&user2), amount2);
+    assert_eq!(client.get_unlock_time(&user2), unlock_time2);
+}

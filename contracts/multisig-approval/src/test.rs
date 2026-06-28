@@ -269,6 +269,28 @@ fn test_reject_after_expiry_panics() {
     client.reject(&approvers.get(0).unwrap(), &tx_id);
 }
 
+// ── expiry boundary conditions ────────────────────────────────────────────────
+
+#[test]
+fn test_approve_at_expiry_minus_one_succeeds() {
+    let (env, contract_id, approvers, _) = setup(2, 3);
+    let client = MultisigContractClient::new(&env, &contract_id);
+    let tx_id = propose(&env, &contract_id, &approvers.get(0).unwrap());
+    env.ledger().with_mut(|l| l.timestamp += 86_399);
+    client.approve(&approvers.get(0).unwrap(), &tx_id);
+    assert_eq!(client.get_proposal(&tx_id).status, TxStatus::Pending);
+}
+
+#[test]
+#[should_panic(expected = "proposal expired")]
+fn test_approve_at_expiry_panics() {
+    let (env, contract_id, approvers, _) = setup(2, 3);
+    let client = MultisigContractClient::new(&env, &contract_id);
+    let tx_id = propose(&env, &contract_id, &approvers.get(0).unwrap());
+    env.ledger().with_mut(|l| l.timestamp += 86_400);
+    client.approve(&approvers.get(0).unwrap(), &tx_id);
+}
+
 // ── get_proposal ──────────────────────────────────────────────────────────────
 
 #[test]
