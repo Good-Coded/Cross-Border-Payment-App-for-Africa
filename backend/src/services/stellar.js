@@ -1,7 +1,7 @@
 const StellarSdk = require('@stellar/stellar-sdk');
 const crypto = require('crypto');
 const logger = require('../utils/logger');
-const { withRetry } = require('../utils/retry');
+const { withRetry, retryWithBackoff } = require('../utils/retry');
 const { withTimeout } = require('../utils/withTimeout');
 const { enqueue } = require('../utils/txQueue');
 const {
@@ -415,13 +415,7 @@ async function withSequenceRecovery(fn, publicKey, keypair) {
     return await fn();
   } catch (err) {
     if (!isBadSeq(err)) throw err;
-    logger.warn('tx_bad_seq detected, attempting bumpSequence recovery', { publicKey });
-    try {
-      await recoverSequence(publicKey, keypair);
-    } catch (recoveryErr) {
-      logger.error('bumpSequence recovery failed', { publicKey, error: recoveryErr.message });
-      throw recoveryErr;
-    }
+    logger.warn('tx_bad_seq detected, re-fetching account sequence and retrying', { publicKey });
     return await fn();
   }
 }
@@ -460,7 +454,10 @@ async function _sendPaymentOnce({
   for (let attempt = 0; attempt < MAX_SEQ_RETRIES; attempt++) {
     try {
       // Fetch a fresh sequence number on every attempt
-      const senderAccount = await withFallback(s => s.loadAccount(senderPublicKey), logger);
+      const senderAccount = await retryWithBackoff(
+        () => withFallback(s => s.loadAccount(senderPublicKey), logger),
+        { label: 'loadAccount(sender)' }
+      );
 
       const txBuilder = new StellarSdk.TransactionBuilder(senderAccount, {
         fee: await feeForPriority(feePriority),
@@ -479,7 +476,10 @@ async function _sendPaymentOnce({
       const transaction = txBuilder.build();
       transaction.sign(senderKeypair);
 
-      const rawResult = await withFallback(s => s.submitTransaction(transaction), logger);
+      const rawResult = await retryWithBackoff(
+        () => withFallback(s => s.submitTransaction(transaction), logger),
+        { label: 'submitTransaction(payment)' }
+      );
       const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(payment)');
       return { transactionHash: result.hash, ledger: result.ledger, type: 'payment' };
     } catch (err) {
@@ -596,10 +596,13 @@ async function _sendBatchPaymentOnce({
   let lastErr;
   for (let attempt = 0; attempt < MAX_SEQ_RETRIES; attempt++) {
     try {
-      const senderAccount = await withFallback(s => s.loadAccount(senderPublicKey));
+      const senderAccount = await retryWithBackoff(
+        () => withFallback(s => s.loadAccount(senderPublicKey)),
+        { label: 'loadAccount(batchSender)' }
+      );
 
       const txBuilder = new StellarSdk.TransactionBuilder(senderAccount, {
-        fee: await withFallback(s => s.fetchBaseFee()),
+        fee: await retryWithBackoff(() => withFallback(s => s.fetchBaseFee()), { label: 'fetchBaseFee(batch)' }),
         networkPassphrase
       });
 
@@ -620,7 +623,10 @@ async function _sendBatchPaymentOnce({
 
       transaction.sign(senderKeypair);
 
-      const result = await withFallback(s => s.submitTransaction(transaction));
+      const result = await retryWithBackoff(
+        () => withFallback(s => s.submitTransaction(transaction)),
+        { label: 'submitTransaction(batch)' }
+      );
       return {
         transactionHash: result.hash,
         ledger: result.ledger,
@@ -813,10 +819,13 @@ async function sendPathPayment({
   );
 
   return withSequenceRecovery(async () => {
-    const senderAccount = await withFallback(s => s.loadAccount(senderPublicKey), 'loadAccount');
+    const senderAccount = await retryWithBackoff(
+      () => withFallback(s => s.loadAccount(senderPublicKey), 'loadAccount'),
+      { label: 'loadAccount(pathPayment)' }
+    );
 
     const txBuilder = new StellarSdk.TransactionBuilder(senderAccount, {
-      fee: await withFallback(s => s.fetchBaseFee(), 'fetchBaseFee'),
+      fee: await retryWithBackoff(() => withFallback(s => s.fetchBaseFee(), 'fetchBaseFee'), { label: 'fetchBaseFee(path)' }),
       networkPassphrase,
     })
       .addOperation(StellarSdk.Operation.pathPaymentStrictSend({
@@ -834,7 +843,10 @@ async function sendPathPayment({
     const transaction = txBuilder.build();
     transaction.sign(senderKeypair);
 
-    const result = await withFallback(s => s.submitTransaction(transaction), 'submitTransaction');
+    const result = await retryWithBackoff(
+      () => withFallback(s => s.submitTransaction(transaction), 'submitTransaction'),
+      { label: 'submitTransaction(pathPayment)' }
+    );
     return { transactionHash: result.hash, ledger: result.ledger };
   }, senderPublicKey, senderKeypair);
 }
@@ -903,8 +915,8 @@ async function sendStrictReceivePathPayment({
  * Add (or update limit on) a trustline for a non-native asset.
  * limit defaults to the Stellar max if not provided.
  */
-async function addTrustline({ publicKey, encryptedSecretKey, asset, limit }) {
-  const assetObj = resolveAsset(asset);
+async function addTrustline({ publicKey, encryptedSecretKey, asset, limit, issuer }) {
+  const assetObj = issuer ? new StellarSdk.Asset(asset, issuer) : resolveAsset(asset);
   const secretKey = decryptPrivateKey(encryptedSecretKey);
   const keypair = StellarSdk.Keypair.fromSecret(secretKey);
 
@@ -939,8 +951,8 @@ async function addTrustline({ publicKey, encryptedSecretKey, asset, limit }) {
  * Remove a trustline by setting limit=0.
  * Stellar will reject this if the account still holds a balance of that asset.
  */
-async function removeTrustline({ publicKey, encryptedSecretKey, asset }) {
-  return addTrustline({ publicKey, encryptedSecretKey, asset, limit: '0' });
+async function removeTrustline({ publicKey, encryptedSecretKey, asset, issuer }) {
+  return addTrustline({ publicKey, encryptedSecretKey, asset, limit: '0', issuer });
 }
 
 /**
@@ -1042,6 +1054,7 @@ async function getStellarStats() {
     return {
       latestLedger: ledger.sequence,
       baseFee: ledger.base_fee_in_stroops,
+      networkPassphrase,
       maxFee: ledger.max_tx_set_size,
       transactionCount: ledger.successful_transaction_count,
       operationCount: ledger.operation_count,
@@ -1313,6 +1326,98 @@ async function refundTestnetWallets(publicKeys) {
   }));
 }
 
+// Fetch Stellar asset info (supply, home domain, num_accounts) for any code+issuer
+async function getAssetMetadataByCodeAndIssuer(code, issuer) {
+  const [assetResponse, issuerAccount] = await Promise.all([
+    server.assets().forCode(code).forIssuer(issuer).call(),
+    server.loadAccount(issuer).catch(() => null),
+  ]);
+
+  const asset = assetResponse.records[0];
+  if (!asset) {
+    const err = new Error(`Asset ${code}:${issuer} not found on Stellar`);
+    err.status = 404;
+    throw err;
+  }
+
+  return {
+    code: asset.asset_code,
+    issuer: asset.asset_issuer,
+    supply: asset.amount,
+    num_accounts: asset.num_accounts,
+    home_domain: issuerAccount?.home_domain || null,
+    flags: asset.flags,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Multisig approval contract — registers a wallet as a business multisig account.
+// Requires MULTISIG_APPROVAL_CONTRACT_ID env var pointing to the deployed Soroban contract.
+// ---------------------------------------------------------------------------
+
+const MULTISIG_APPROVAL_CONTRACT_ID = process.env.MULTISIG_APPROVAL_CONTRACT_ID;
+const sorobanRpcUrl = process.env.SOROBAN_RPC_URL || (isTestnet
+  ? 'https://soroban-testnet.stellar.org'
+  : 'https://mainnet.soroban.stellar.org');
+const SOROBAN_CONFIRMATION_TIMEOUT_MS = parseInt(process.env.SOROBAN_CONFIRMATION_TIMEOUT_MS || '30000', 10);
+
+async function initMultisigApproval({ publicKey, encryptedSecretKey }) {
+  if (!MULTISIG_APPROVAL_CONTRACT_ID) {
+    const err = new Error('MULTISIG_APPROVAL_CONTRACT_ID is not configured.');
+    err.status = 500;
+    throw err;
+  }
+
+  const secretKey = decryptPrivateKey(encryptedSecretKey);
+  const keypair = StellarSdk.Keypair.fromSecret(secretKey);
+  const rpc = new StellarSdk.SorobanRpc.Server(sorobanRpcUrl);
+  const account = await rpc.getAccount(publicKey);
+  const contract = new StellarSdk.Contract(MULTISIG_APPROVAL_CONTRACT_ID);
+
+  let fee;
+  try {
+    const stats = await rpc.getFeeStats();
+    fee = stats?.sorobanInclusionFee?.p90 != null
+      ? String(stats.sorobanInclusionFee.p90)
+      : String(StellarSdk.BASE_FEE * 10);
+  } catch {
+    fee = String(StellarSdk.BASE_FEE * 10);
+  }
+
+  const args = [StellarSdk.nativeToScVal(publicKey, { type: 'address' })];
+
+  const tx = new StellarSdk.TransactionBuilder(account, { fee, networkPassphrase })
+    .addOperation(contract.call('register_business', ...args))
+    .setTimeout(30)
+    .build();
+
+  const prepared = await rpc.prepareTransaction(tx);
+  prepared.sign(keypair);
+
+  const result = await rpc.sendTransaction(prepared);
+  if (result.status === 'ERROR') {
+    throw Object.assign(new Error(`register_business failed: ${result.errorResult}`), { status: 400 });
+  }
+
+  const maxIterations = Math.ceil(SOROBAN_CONFIRMATION_TIMEOUT_MS / 1000);
+  let response = result;
+  let iterations = 0;
+  while (response.status === 'PENDING' || response.status === 'NOT_FOUND') {
+    if (iterations >= maxIterations) {
+      throw Object.assign(new Error('Multisig approval confirmation timeout'), { status: 504 });
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+    response = await rpc.getTransaction(result.hash);
+    iterations++;
+  }
+
+  if (response.status !== 'SUCCESS') {
+    throw Object.assign(new Error(`Multisig approval transaction failed: ${response.status}`), { status: 400 });
+  }
+
+  return { transactionHash: result.hash };
+}
+
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
@@ -1356,4 +1461,6 @@ module.exports = {
   recoverSequence,
   withSequenceRecovery,
   validateNetworkPassphrase,
+  getAssetMetadataByCodeAndIssuer,
+  initMultisigApproval,
 };
