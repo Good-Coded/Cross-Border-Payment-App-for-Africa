@@ -20,24 +20,20 @@ const {
 const webhook = require("../services/webhook");
 const cache = require("../utils/cache");
 const { sendTransactionEmail } = require("../services/email");
+const { persistAndBroadcast } = require("../services/notificationInbox");
 const { checkVelocity, checkDailyLimit } = require("../services/fraudDetection");
 const { checkFraud, logFraudBlock } = require("../services/fraudDetection");
 const { parseHistoryFrom, parseHistoryTo, normalizeAsset, validateDateRange } = require("../utils/historyQuery");
 const { isMemoRequired } = require("../services/memoRequired");
 const { creditReferralReward } = require("../services/referralRewardService");
-const { mintPoints } = require("../services/loyaltyToken");
+const { enqueueLoyaltyMint } = require("../jobs/loyaltyMintJob");
 const { depositFee } = require("../services/feeDistributor");
+const { getActiveConfig } = require("../services/feeConfigService");
 const logger = require("../utils/logger");
 
-// Configurable KYC transaction threshold in USD equivalent
 const KYC_THRESHOLD_USD = parseFloat(process.env.KYC_THRESHOLD_USD || "100");
 
-// Platform fee in basis points (e.g. 50 = 0.5%)
-const FEE_BPS = parseInt(process.env.FEE_BPS || "50", 10);
-
-function calculateFee(amount) {
-  return parseFloat((parseFloat(amount) * FEE_BPS / 10000).toFixed(7));
-}
+const FALLBACK_PLATFORM_FEE_BPS = parseInt(process.env.PLATFORM_FEE_BPS || "250", 10);
 
 /**
  * Build the structured fee breakdown for a payment.
@@ -45,10 +41,16 @@ function calculateFee(amount) {
  * @param {string}        asset        - e.g. "USDC" or "XLM"
  * @param {string|null}   feeCharged   - Stellar fee_charged in stroops (from Horizon result)
  */
-function buildFeeBreakdown(grossAmount, asset, feeCharged) {
+async function buildFeeBreakdown(grossAmount, asset, feeCharged) {
   const gross = parseFloat(grossAmount);
-  const PLATFORM_FEE_BPS = parseInt(process.env.PLATFORM_FEE_BPS || "250", 10);
-  const platformFee = parseFloat((gross * PLATFORM_FEE_BPS / 10000).toFixed(7));
+  let feeBps = FALLBACK_PLATFORM_FEE_BPS;
+  try {
+    const cfg = await getActiveConfig('platform', asset);
+    if (cfg) feeBps = cfg.fee_bps;
+  } catch (_) {
+    // fall back to env var if cache/DB is unavailable
+  }
+  const platformFee = parseFloat((gross * feeBps / 10000).toFixed(7));
   const stellarBaseFeeXlm = feeCharged != null
     ? parseFloat((parseInt(feeCharged, 10) / 1e7).toFixed(7))
     : null;
@@ -56,7 +58,7 @@ function buildFeeBreakdown(grossAmount, asset, feeCharged) {
 
   return {
     gross_amount_usdc: parseFloat(gross.toFixed(7)),
-    platform_fee_bps: PLATFORM_FEE_BPS,
+    platform_fee_bps: feeBps,
     platform_fee_usdc: platformFee,
     stellar_base_fee_xlm: stellarBaseFeeXlm,
     net_amount_usdc: parseFloat(netAmount.toFixed(7)),
@@ -210,15 +212,27 @@ async function estimateFees(req, res, next) {
     }
     let stellarFeeStroops = null;
     try { stellarFeeStroops = await fetchFee(); } catch (_) { /* non-fatal */ }
-    const breakdown = buildFeeBreakdown(amount, asset, stellarFeeStroops);
+    const breakdown = await buildFeeBreakdown(amount, asset, stellarFeeStroops);
     res.json({ fee_breakdown: breakdown });
   } catch (err) {
     next(err);
   }
 }
 
-function getFeeRate(req, res) {
-  res.json({ fee_bps: FEE_BPS });
+async function getFeeRate(req, res, next) {
+  try {
+    let feeBps = FALLBACK_PLATFORM_FEE_BPS;
+    const asset = req.query.asset || 'USDC';
+    try {
+      const cfg = await getActiveConfig('platform', asset);
+      if (cfg) feeBps = cfg.fee_bps;
+    } catch (_) {
+      // fall back to env var
+    }
+    res.json({ fee_bps: feeBps });
+  } catch (err) {
+    next(err);
+  }
 }
 
 async function getFeeStats(req, res, next) {
@@ -378,7 +392,7 @@ async function send(req, res, next) {
     const ledger_close_time = await fetchLedgerCloseTime(ledger);
 
     // Build fee breakdown
-    const fee_breakdown = buildFeeBreakdown(amount, asset, feeCharged ?? null);
+    const fee_breakdown = await buildFeeBreakdown(amount, asset, feeCharged ?? null);
 
     // Save to DB
     const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
@@ -402,12 +416,11 @@ async function send(req, res, next) {
       creditReferralReward(req.user.userId, txId).catch(() => {});
     }
 
-    const loyaltyPoints = Math.max(1, Math.floor(parseFloat(amount)));
-    mintPoints({ recipientWallet: public_key, points: loyaltyPoints }).catch(() => {});
+    // Queue loyalty mint for background processing after confirmation
+    enqueueLoyaltyMint(txId, req.user.userId, public_key, amount, asset).catch(() => {});
 
-    const PLATFORM_FEE_BPS = parseInt(process.env.PLATFORM_FEE_BPS || "250", 10);
-    if (asset === "USDC" && PLATFORM_FEE_BPS > 0) {
-      const feeStroops = Math.floor(parseFloat(amount) * 1e7 * PLATFORM_FEE_BPS / 10000);
+    if (asset === "USDC" && fee_breakdown.platform_fee_bps > 0) {
+      const feeStroops = Math.floor(parseFloat(amount) * 1e7 * fee_breakdown.platform_fee_bps / 10000);
       if (feeStroops > 0) {
         depositFee(feeStroops).catch((err) =>
           logger.warn("Fee deposit failed (non-critical):", { error: err.message }),
@@ -432,6 +445,24 @@ async function send(req, res, next) {
     )
       .then(({ rows }) => rows[0] && sendTransactionEmail(rows[0].email, "received", emailTxData))
       .catch(() => {});
+
+    // Persist in-app notifications
+    persistAndBroadcast(req.user.userId, 'payment_sent', 'Payment Sent',
+      `You sent ${amount} ${asset} to ${recipient_address}`,
+      emailTxData
+    ).catch(() => {});
+
+    db.query(
+      "SELECT u.user_id FROM users u JOIN wallets w ON w.user_id = u.id WHERE w.public_key = $1 LIMIT 1",
+      [recipient_address],
+    ).then(({ rows }) => {
+      if (rows[0]) {
+        persistAndBroadcast(rows[0].user_id, 'payment_received', 'Payment Received',
+          `You received ${amount} ${asset}`,
+          emailTxData
+        ).catch(() => {});
+      }
+    }).catch(() => {});
 
     res.json({
       message: type === "claimable_balance" ? "Claimable balance created" : "Payment sent successfully",

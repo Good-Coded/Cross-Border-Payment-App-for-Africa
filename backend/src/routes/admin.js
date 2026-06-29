@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { body, validationResult } = require('express-validator');
+const { body, param, validationResult } = require('express-validator');
 const StellarSdk = require('@stellar/stellar-sdk');
 const authMiddleware = require('../middleware/auth');
 const isAdmin = require('../middleware/isAdmin');
@@ -32,6 +32,12 @@ const {
   getAuditLogs,
 } = require('../controllers/adminController');
 const { getDeadLetterNotifications } = require('../controllers/notificationController');
+const {
+  listConfigs,
+  createFeeConfig,
+  updateFeeConfig,
+  listHistory,
+} = require('../controllers/feeConfigController');
 
 const validate = (req, res, next) => {
   const errors = validationResult(req);
@@ -289,5 +295,159 @@ router.get('/notifications/dead-letter', getDeadLetterNotifications);
 // Immutable Audit Log (#698)
 // ---------------------------------------------------------------------------
 router.get('/audit-logs', getAuditLogs);
+
+// ---------------------------------------------------------------------------
+// Fee Configuration CRUD with Audit Trail
+// ---------------------------------------------------------------------------
+
+/**
+ * @openapi
+ * /api/admin/fee-configs:
+ *   get:
+ *     summary: List all fee configurations (admin only)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of fee configurations
+ *       403:
+ *         description: Admin access required
+ */
+router.get('/fee-configs', listConfigs);
+
+/**
+ * @openapi
+ * /api/admin/fee-configs/history:
+ *   get:
+ *     summary: Get full fee change history (admin only)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Full fee change history
+ *       403:
+ *         description: Admin access required
+ */
+router.get('/fee-configs/history', listHistory);
+
+/**
+ * @openapi
+ * /api/admin/fee-configs:
+ *   post:
+ *     summary: Create a new fee configuration (admin only)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [fee_type, asset_code, fee_bps, max_fee_usdc, min_fee_usdc]
+ *             properties:
+ *               fee_type:
+ *                 type: string
+ *                 enum: [platform, referral, loyalty_redemption]
+ *               asset_code:
+ *                 type: string
+ *               fee_bps:
+ *                 type: integer
+ *                 maximum: 1000
+ *               max_fee_usdc:
+ *                 type: number
+ *               min_fee_usdc:
+ *                 type: number
+ *               effective_from:
+ *                 type: string
+ *                 format: date-time
+ *     responses:
+ *       201:
+ *         description: Fee configuration created
+ *       400:
+ *         description: Validation error
+ *       403:
+ *         description: Admin access required
+ */
+router.post(
+  '/fee-configs',
+  [
+    body('fee_type')
+      .notEmpty().withMessage('fee_type is required')
+      .isIn(['platform', 'referral', 'loyalty_redemption']).withMessage('fee_type must be one of: platform, referral, loyalty_redemption'),
+    body('asset_code').notEmpty().withMessage('asset_code is required').trim().isLength({ max: 12 }),
+    body('fee_bps')
+      .notEmpty().withMessage('fee_bps is required')
+      .isInt({ min: 0, max: 1000 }).withMessage('fee_bps must be between 0 and 1000'),
+    body('max_fee_usdc').notEmpty().withMessage('max_fee_usdc is required').isFloat({ min: 0 }),
+    body('min_fee_usdc').notEmpty().withMessage('min_fee_usdc is required').isFloat({ min: 0 }),
+    body('effective_from').optional().isISO8601().withMessage('effective_from must be a valid ISO 8601 date'),
+  ],
+  validate,
+  createFeeConfig
+);
+
+/**
+ * @openapi
+ * /api/admin/fee-configs/{id}:
+ *   patch:
+ *     summary: Deactivate current config and create a new active one (admin only)
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               fee_type:
+ *                 type: string
+ *                 enum: [platform, referral, loyalty_redemption]
+ *               asset_code:
+ *                 type: string
+ *               fee_bps:
+ *                 type: integer
+ *                 maximum: 1000
+ *               max_fee_usdc:
+ *                 type: number
+ *               min_fee_usdc:
+ *                 type: number
+ *               effective_from:
+ *                 type: string
+ *                 format: date-time
+ *     responses:
+ *       200:
+ *         description: Fee configuration updated
+ *       400:
+ *         description: Validation error
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Fee configuration not found
+ */
+router.patch(
+  '/fee-configs/:id',
+  [
+    param('id').isInt().withMessage('id must be an integer'),
+    body('fee_type').optional().isIn(['platform', 'referral', 'loyalty_redemption']).withMessage('fee_type must be one of: platform, referral, loyalty_redemption'),
+    body('asset_code').optional().trim().isLength({ max: 12 }),
+    body('fee_bps').optional().isInt({ min: 0, max: 1000 }).withMessage('fee_bps must be between 0 and 1000'),
+    body('max_fee_usdc').optional().isFloat({ min: 0 }),
+    body('min_fee_usdc').optional().isFloat({ min: 0 }),
+    body('effective_from').optional().isISO8601().withMessage('effective_from must be a valid ISO 8601 date'),
+  ],
+  validate,
+  updateFeeConfig
+);
 
 module.exports = router;

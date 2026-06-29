@@ -76,13 +76,17 @@ async function creditReferralReward(refereeUserId, paymentId) {
     return;
   }
 
-  // 4. Notify referrer (fire-and-forget)
-  const message = `${referee_email} just made their first payment using your referral link! You've earned ${REFERRAL_REWARD_TOKENS} loyalty points.`;
+// 4. Notify referrer (fire-and-forget)
+   const message = `${referee_email} just made their first payment using your referral link! You've earned ${REFERRAL_REWARD_TOKENS} loyalty points.`;
 
-  sendPushToUser(referrer_id, {
-    title: 'Referral reward earned! 🎉',
-    body: message,
-  }).catch(() => {});
-}
+   const { persistAndBroadcast } = require('../services/notificationInbox');
+   persistAndBroadcast(referrer_id, 'referral_reward_earned', 'Referral reward earned! 🎉',
+     message, { points: REFERRAL_REWARD_TOKENS }
+   ).catch(() => {});
+   sendPushToUser(referrer_id, {
+     title: 'Referral reward earned! 🎉',
+     body: message,
+   }).catch(() => {});
+ }
 
 module.exports = { creditReferralReward, REFERRAL_REWARD_TOKENS };

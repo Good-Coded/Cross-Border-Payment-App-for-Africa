@@ -778,12 +778,14 @@ function validateBulkRequest(req, res) {
 async function bulkSuspend(req, res, next) {
   if (!validateBulkRequest(req, res)) return;
   const { userIds, reason } = req.body;
+  const { persistAndBroadcast } = require('../services/notificationInbox');
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(
+    const { rows: affectedUsers } = await client.query(
       `UPDATE users SET is_suspended = true, suspension_reason = $1, suspended_at = NOW()
-       WHERE id = ANY($2::uuid[]) AND is_suspended = false`,
+       WHERE id = ANY($2::uuid[]) AND is_suspended = false
+       RETURNING id`,
       [reason || null, userIds]
     );
     await client.query('COMMIT');
@@ -793,14 +795,13 @@ async function bulkSuspend(req, res, next) {
       newValue: { user_ids: userIds, reason: reason || null },
     });
 
-    // Queue suspension emails (fire-and-forget)
-    db.query('SELECT email, full_name FROM users WHERE id = ANY($1::uuid[])', [userIds])
-      .then(({ rows }) => rows.forEach(u =>
-        sendEmail(u.email, 'Account Suspended',
-          `Hello ${u.full_name || 'user'}, your account has been suspended. Reason: ${reason || 'Policy violation'}.`)
-          .catch(() => {})
-      ))
-      .catch(() => {});
+    // Send in-app notifications for suspended users (fire-and-forget)
+    affectedUsers.forEach(u => {
+      persistAndBroadcast(u.id, 'account_suspended', 'Account Suspended',
+        `Your account has been suspended. Reason: ${reason || 'Policy violation'}`,
+        { reason: reason || null }
+      ).catch(() => {});
+    });
 
     res.json({ message: 'Users suspended', count: userIds.length });
   } catch (err) {
@@ -814,12 +815,14 @@ async function bulkSuspend(req, res, next) {
 async function bulkUnsuspend(req, res, next) {
   if (!validateBulkRequest(req, res)) return;
   const { userIds } = req.body;
+  const { persistAndBroadcast } = require('../services/notificationInbox');
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(
+    const { rows: affectedUsers } = await client.query(
       `UPDATE users SET is_suspended = false, suspension_reason = NULL, suspended_at = NULL
-       WHERE id = ANY($1::uuid[]) AND is_suspended = true`,
+       WHERE id = ANY($1::uuid[]) AND is_suspended = true
+       RETURNING id`,
       [userIds]
     );
     await client.query('COMMIT');
@@ -827,6 +830,15 @@ async function bulkUnsuspend(req, res, next) {
       type: 'bulk_user',
       newValue: { user_ids: userIds },
     });
+
+    // Send in-app notifications for unsuspended users (fire-and-forget)
+    affectedUsers.forEach(u => {
+      persistAndBroadcast(u.id, 'account_unsuspended', 'Account Reinstated',
+        'Your account suspension has been lifted. You can now use AfriPay normally.',
+        {}
+      ).catch(() => {});
+    });
+
     res.json({ message: 'Users unsuspended', count: userIds.length });
   } catch (err) {
     await client.query('ROLLBACK');
