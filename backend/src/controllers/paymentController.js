@@ -22,7 +22,7 @@ const { checkVelocity, checkDailyLimit } = require("../services/fraudDetection")
 const { checkFraud, logFraudBlock } = require("../services/fraudDetection");
 const { parseHistoryFrom, parseHistoryTo, normalizeAsset, validateDateRange } = require("../utils/historyQuery");
 const { isMemoRequired } = require("../services/memoRequired");
-const { awardReferralCredit } = require("./referralController");
+const { creditReferralReward } = require("../services/referralRewardService");
 const { mintPoints } = require("../services/loyaltyToken");
 const { depositFee } = require("../services/feeDistributor");
 const logger = require("../utils/logger");
@@ -346,7 +346,7 @@ async function send(req, res, next) {
       [public_key],
     );
     if (parseInt(txCount.rows[0].cnt, 10) === 1) {
-      awardReferralCredit(req.user.userId).catch(() => {});
+      creditReferralReward(req.user.userId, txId).catch(() => {});
     }
 
     const loyaltyPoints = Math.max(1, Math.floor(parseFloat(amount)));
