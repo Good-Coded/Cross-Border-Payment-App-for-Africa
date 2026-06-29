@@ -4,6 +4,7 @@ const logger = require('../utils/logger');
 const { withRetry, retryWithBackoff } = require('../utils/retry');
 const { withTimeout } = require('../utils/withTimeout');
 const { enqueue } = require('../utils/txQueue');
+const { checkMemoRequired } = require('./memoRequired');
 const {
   AccountResponseSchema,
   TransactionSubmitResponseSchema,
@@ -440,6 +441,15 @@ async function _sendPaymentOnce({
 }, logger) {
   // Guard against testnet/mainnet mixup
   validateNetworkPassphrase(networkPassphrase);
+
+  // Enforce memo requirement for known exchange destinations
+  const memoRequired = await checkMemoRequired(recipientPublicKey);
+  if (memoRequired && !memo) {
+    const err = new Error('The destination account requires a transaction memo. Please add a memo and retry.');
+    err.status = 400;
+    err.code = 'MEMO_REQUIRED';
+    throw err;
+  }
 
   const assetObj = resolveAsset(asset);
 

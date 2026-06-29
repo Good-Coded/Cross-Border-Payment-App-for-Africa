@@ -3,6 +3,7 @@ const https = require('https');
 const db = require('../db');
 const logger = require('../utils/logger');
 const { isPrivateIp } = require('../utils/ssrfValidator');
+const { validateOutboundUrl } = require('../utils/ssrf');
 const { decryptSecret } = require('../utils/symmetricEncryption');
 
 const MAX_ATTEMPTS = 3;
@@ -63,6 +64,10 @@ function httpsPost(url, body, signature) {
     };
     const req = https.request(options, (res) => {
       res.resume();
+      // Block redirects to prevent DNS rebinding via 3xx responses
+      if (res.statusCode >= 300 && res.statusCode < 400) {
+        return reject(new Error(`Redirect blocked (HTTP ${res.statusCode}) — follow redirects is disabled for security`));
+      }
       res.statusCode >= 200 && res.statusCode < 300 ? resolve(res.statusCode) : reject(new Error(`HTTP ${res.statusCode}`));
     });
     req.on('error', reject);
@@ -92,8 +97,9 @@ async function updateDeliveryLog(deliveryId, status, statusCode, responseTimeMs,
 
 async function deliverWithRetry(webhookId, url, secret, payload, attempt = 0) {
   // Re-validate URL before each delivery to catch DNS rebinding / stale records
-  if (!await isPublicHttpsUrl(url)) {
-    logger.error('Webhook delivery blocked: URL failed SSRF validation', { url });
+  const ssrfCheck = await validateOutboundUrl(url);
+  if (!ssrfCheck.valid) {
+    logger.error('Webhook delivery blocked: URL failed SSRF validation', { url, reason: ssrfCheck.error });
     await createDeliveryLog(webhookId, payload.event, url, attempt + 1, MAX_ATTEMPTS, payload)
       .then((id) => updateDeliveryLog(id, 'failed', null, null, 'SSRF validation failed'));
     return;

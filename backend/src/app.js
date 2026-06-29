@@ -43,7 +43,7 @@ const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 
 const logger = require('./utils/logger');
-const { runHealthChecks } = require('./services/health');
+const { runHealthChecks, runDeepHealthChecks } = require('./services/health');
 
 const app = express();
 
@@ -214,6 +214,22 @@ app.get('/health', async (req, res) => {
     });
   } catch {
     res.status(503).json({ status: 'degraded' });
+  }
+});
+
+const deepHealthLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  message: { error: 'Too many health check requests.' },
+});
+
+app.get('/health/deep', deepHealthLimiter, async (req, res) => {
+  try {
+    const health = await runDeepHealthChecks();
+    const httpStatus = health.status === 'unhealthy' ? 503 : 200;
+    res.status(httpStatus).json(health);
+  } catch {
+    res.status(503).json({ status: 'unhealthy' });
   }
 });
 

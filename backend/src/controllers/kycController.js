@@ -1,6 +1,10 @@
 const db = require("../db");
+const { amlScreen } = require("../services/amlScreening");
+const audit = require("../services/audit");
+const logger = require("../utils/logger");
 
 const ALLOWED_ID_TYPES = ["national_id", "passport", "drivers_license", "voters_card"];
+const AML_RESCREEN_THRESHOLD_USD = 1000;
 
 async function submitKYC(req, res, next) {
   try {
@@ -57,6 +61,18 @@ async function submitKYC(req, res, next) {
       [JSON.stringify(kycData), document_expiry_date || null, req.user.userId],
     );
 
+    // AML screening hook — runs after successful KYC document submission
+    const walletResult = await db.query("SELECT public_key FROM wallets WHERE user_id = $1 LIMIT 1", [req.user.userId]);
+    const walletAddress = walletResult.rows[0]?.public_key || null;
+    if (walletAddress) {
+      const amlResult = await amlScreen(walletAddress, { userId: req.user.userId });
+      if (amlResult.status === 'flagged') {
+        logger.warn('AML screening flagged user wallet after KYC submission', { userId: req.user.userId, walletAddress, amlResult });
+        await audit.log(req.user.userId, 'aml_flagged', req.ip, req.headers['user-agent'], { walletAddress, amlResult });
+        return res.status(403).json({ error: 'Payment blocked: wallet flagged by AML screening.' });
+      }
+    }
+
     res.status(200).json({
       message: "KYC submitted successfully. Your application is under review.",
       kyc_status: "pending",
@@ -64,6 +80,23 @@ async function submitKYC(req, res, next) {
   } catch (err) {
     next(err);
   }
+}
+
+/**
+ * Re-screen a sender wallet for payments over AML_RESCREEN_THRESHOLD_USD.
+ * Call this from the payment flow before submitting high-value transactions.
+ */
+async function amlRescreenForPayment(userId, walletAddress, amountUsd) {
+  if (amountUsd < AML_RESCREEN_THRESHOLD_USD) return null;
+  const amlResult = await amlScreen(walletAddress, { userId });
+  if (amlResult.status === 'flagged') {
+    logger.warn('AML re-screen flagged wallet for high-value payment', { userId, walletAddress, amountUsd, amlResult });
+    await audit.log(userId, 'aml_payment_flagged', null, null, { walletAddress, amountUsd, amlResult });
+    const err = new Error('Payment blocked: wallet flagged by AML screening.');
+    err.status = 403;
+    throw err;
+  }
+  return amlResult;
 }
 
 async function getKYCStatus(req, res, next) {
@@ -94,4 +127,4 @@ async function getKYCStatus(req, res, next) {
   }
 }
 
-module.exports = { submitKYC, getKYCStatus };
+module.exports = { submitKYC, getKYCStatus, amlRescreenForPayment };
