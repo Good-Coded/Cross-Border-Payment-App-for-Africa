@@ -1,13 +1,14 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const Sentry = require('@sentry/node');
 
 const requestId = require('./middleware/requestId');
 const metricsMiddleware = require('./middleware/metricsMiddleware');
 const { registry } = require('./utils/metrics');
+const rateLimiters = require('./middleware/rateLimiter');
+const { getHealth: getLedgerHealth } = require('./services/ledgerListener');
 
 const authRoutes = require('./routes/auth');
 const walletRoutes = require('./routes/wallet');
@@ -76,19 +77,12 @@ app.use(helmet({
 app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true, maxAge: 86400 }));
 app.use(express.json());
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: { error: 'Too many requests, please try again later.' },
-});
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { error: 'Too many auth attempts, please try again later.' },
-});
-
-app.use('/api', limiter);
-app.use('/api/auth', authLimiter);
+// Granular per-endpoint rate limiting (Redis-backed when REDIS_URL is set)
+app.use('/api/auth/login', rateLimiters.authLimiter);
+app.use('/api/auth/register', rateLimiters.authLimiter);
+app.use('/api/payments/send', rateLimiters.paymentLimiter);
+app.use('/api/admin', rateLimiters.adminLimiter);
+app.use('/api', rateLimiters.readLimiter);
 
 app.use('/api/auth', authRoutes);
 app.use('/api/wallet', walletRoutes);
@@ -215,6 +209,10 @@ app.get('/health', async (req, res) => {
   } catch {
     res.status(503).json({ status: 'degraded' });
   }
+});
+
+app.get('/api/health/ledger-listener', (req, res) => {
+  res.json(getLedgerHealth());
 });
 
 app.get('/metrics', async (req, res) => {
