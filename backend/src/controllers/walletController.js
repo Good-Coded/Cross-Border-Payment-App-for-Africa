@@ -18,10 +18,12 @@ const {
   getDataEntries,
   getAccountFlags,
   setAccountFlags,
+  initMultisigApproval,
 } = require('../services/stellar');
 const QRCode = require('qrcode');
 const cache = require('../utils/cache');
 const audit = require('../services/audit');
+const { verifyToken } = require('../services/twofa');
 
 
 const MAX_WALLETS_PER_USER = 5;
@@ -63,13 +65,13 @@ async function getWallet(req, res, next) {
 
     const cached = await cache.get(cacheKey);
     if (cached) {
-      return res.json({ id: wallet.id, public_key, label: wallet.label, is_default: wallet.is_default, balances: cached, cached: true });
+      return res.json({ id: wallet.id, public_key, label: wallet.label, is_default: wallet.is_default, ...cached, cached: true });
     }
 
-    const balances = await getBalance(public_key);
-    await cache.set(cacheKey, balances, cache.BALANCE_TTL);
+    const balanceData = await getBalance(public_key);
+    await cache.set(cacheKey, balanceData, cache.BALANCE_TTL);
 
-    res.json({ id: wallet.id, public_key, label: wallet.label, is_default: wallet.is_default, balances, cached: false });
+    res.json({ id: wallet.id, public_key, label: wallet.label, is_default: wallet.is_default, ...balanceData, cached: false });
   } catch (err) {
     next(err);
   }
@@ -89,16 +91,16 @@ async function listWallets(req, res, next) {
     const wallets = await Promise.all(
       result.rows.map(async (w) => {
         const cacheKey = `balance:${w.public_key}`;
-        let balances = await cache.get(cacheKey);
-        if (!balances) {
+        let balanceData = await cache.get(cacheKey);
+        if (!balanceData) {
           try {
-            balances = await getBalance(w.public_key);
-            await cache.set(cacheKey, balances, cache.BALANCE_TTL);
+            balanceData = await getBalance(w.public_key);
+            await cache.set(cacheKey, balanceData, cache.BALANCE_TTL);
           } catch {
-            balances = [];
+            balanceData = { account_exists: false, balances: [] };
           }
         }
-        return { ...w, balances };
+        return { ...w, ...balanceData };
       }),
     );
 
@@ -168,9 +170,14 @@ async function getQRCode(req, res, next) {
 
 // ---------------------------------------------------------------------------
 // GET /wallet/transactions  (optionally ?wallet_id=<uuid>)
+// DEPRECATED — use GET /api/payments/history instead
 // ---------------------------------------------------------------------------
 async function getWalletTransactions(req, res, next) {
   try {
+    res.set('Deprecation', 'true');
+    res.set('Link', '</api/payments/history>; rel="successor-version"');
+    res.set('Sunset', 'Sat, 01 Jan 2026 00:00:00 GMT');
+
     const wallet = await resolveWallet(req.user.userId, req.query.wallet_id || null);
     if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
 
@@ -192,14 +199,21 @@ async function getWalletTransactions(req, res, next) {
 // ---------------------------------------------------------------------------
 async function exportKey(req, res, next) {
   try {
-    const { password, wallet_id } = req.body;
+    const { password, wallet_id, totp_code } = req.body;
     if (!password) return res.status(400).json({ error: 'Password is required' });
 
-    const userResult = await db.query('SELECT password_hash FROM users WHERE id = $1', [req.user.userId]);
+    const userResult = await db.query('SELECT password_hash, totp_enabled, totp_secret FROM users WHERE id = $1', [req.user.userId]);
     if (!userResult.rows[0]) return res.status(404).json({ error: 'User not found' });
 
     const valid = await bcrypt.compare(password, userResult.rows[0].password_hash);
     if (!valid) return res.status(401).json({ error: 'Incorrect password' });
+
+    // Check 2FA if enabled
+    if (userResult.rows[0].totp_enabled) {
+      if (!totp_code) return res.status(403).json({ error: '2FA verification required' });
+      const isValidTotp = verifyToken(userResult.rows[0].totp_secret, totp_code);
+      if (!isValidTotp) return res.status(403).json({ error: '2FA verification required' });
+    }
 
     const wallet = await resolveWallet(req.user.userId, wallet_id || null);
     if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
@@ -217,8 +231,22 @@ async function exportKey(req, res, next) {
 // ---------------------------------------------------------------------------
 async function upgradeToBusinessAccount(req, res, next) {
   try {
+    const wallet = await resolveWallet(req.user.userId, req.body.wallet_id || null);
+    if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
+
+    const { transactionHash } = await initMultisigApproval({
+      publicKey: wallet.public_key,
+      encryptedSecretKey: wallet.encrypted_secret_key,
+    });
+
     await db.query(`UPDATE users SET account_type = 'business' WHERE id = $1`, [req.user.userId]);
-    res.json({ message: 'Account upgraded to business' });
+
+    audit.log(req.user.userId, 'upgrade_to_business', req.ip, req.headers['user-agent'], {
+      wallet_id: wallet.id,
+      transaction_hash: transactionHash,
+    });
+
+    res.json({ message: 'Account upgraded to business', transaction_hash: transactionHash });
   } catch (err) {
     next(err);
   }
@@ -320,13 +348,14 @@ async function listTrustlines(req, res, next) {
 
 async function addTrustlineHandler(req, res, next) {
   try {
-    const { asset, limit, wallet_id } = req.body;
+    const { asset, asset_issuer, limit, wallet_id } = req.body;
     const wallet = await resolveWallet(req.user.userId, wallet_id || null);
     if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
     const { transactionHash } = await addTrustline({
       publicKey: wallet.public_key,
       encryptedSecretKey: wallet.encrypted_secret_key,
       asset,
+      issuer: asset_issuer || undefined,
       limit,
     });
     res.status(201).json({ message: 'Trustline added', transaction_hash: transactionHash });
@@ -338,12 +367,14 @@ async function addTrustlineHandler(req, res, next) {
 async function removeTrustlineHandler(req, res, next) {
   try {
     const { asset } = req.params;
-    const wallet = await resolveWallet(req.user.userId, req.query.wallet_id || null);
+    const { wallet_id, asset_issuer } = req.query;
+    const wallet = await resolveWallet(req.user.userId, wallet_id || null);
     if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
     const { transactionHash } = await removeTrustline({
       publicKey: wallet.public_key,
       encryptedSecretKey: wallet.encrypted_secret_key,
       asset,
+      issuer: asset_issuer || undefined,
     });
     res.json({ message: 'Trustline removed', transaction_hash: transactionHash });
   } catch (err) {

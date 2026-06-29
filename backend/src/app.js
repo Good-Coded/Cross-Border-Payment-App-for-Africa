@@ -19,6 +19,8 @@ const anchorRoutes = require('./routes/anchor');
 const kycRoutes = require('./routes/kyc');
 const adminRoutes = require('./routes/admin');
 const webhookRoutes = require('./routes/webhooks');
+const toolsRoutes = require('./routes/tools');
+const assetsRoutes = require('./routes/assets');
 const notificationRoutes = require('./routes/notifications');
 const sep10Routes = require('./routes/sep10');
 const sep31Routes = require('./routes/sep31');
@@ -33,7 +35,10 @@ const loyaltyRoutes = require('./routes/loyalty');
 const disputeRoutes = require('./routes/disputes');
 const pricesRoutes = require('./routes/prices');
 const channelsRoutes = require('./routes/channels');
+const contractsRoutes = require('./routes/contracts');
+const ledgerRoutes = require('./routes/ledger');
 const ipAllowlist = require('./middleware/ipAllowlist');
+const geoRestriction = require('./middleware/geoRestriction');
 
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
@@ -42,6 +47,10 @@ const logger = require('./utils/logger');
 const { runHealthChecks } = require('./services/health');
 
 const app = express();
+
+// Serve uploaded avatars
+const path = require('path');
+app.use('/uploads/avatars', express.static(path.join(__dirname, '../uploads/avatars')));
 
 app.use(Sentry.Handlers.requestHandler());
 app.use(requestId);
@@ -77,9 +86,9 @@ app.use('/api', rateLimiters.readLimiter);
 
 app.use('/api/auth', authRoutes);
 app.use('/api/wallet', walletRoutes);
-app.use('/api/payments', paymentRoutes);
-app.use('/api/payment-requests', paymentRequestRoutes);
-app.use('/api/scheduled-payments', scheduledPaymentRoutes);
+app.use('/api/payments', geoRestriction, paymentRoutes);
+app.use('/api/payment-requests', geoRestriction, paymentRequestRoutes);
+app.use('/api/scheduled-payments', geoRestriction, scheduledPaymentRoutes);
 app.use('/api/anchor', anchorRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/dex', dexRoutes);
@@ -92,11 +101,19 @@ app.use('/api/kyc', kycRoutes);
 app.use('/api/admin', ipAllowlist, adminRoutes);
 app.use('/api/prices', pricesRoutes);
 app.use('/api/channels', channelsRoutes);
+app.use('/api/contracts', contractsRoutes);
+app.use('/api/ledger', ledgerRoutes);
 app.use('/api/webhooks', webhookRoutes);
+app.use('/api/tools', toolsRoutes);
+app.use('/api/dev', toolsRoutes); // legacy alias
+app.use('/api/assets', assetsRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/.well-known/stellar', sep10Routes);
+app.use('/api/sep10', sep10Routes);
 app.use('/api/sep31', sep31Routes);
-app.use('/api/dev', devRoutes);
+if (process.env.NODE_ENV !== 'production') {
+  app.use('/api/dev', devRoutes);
+}
 app.use('/', stellarTomlRoutes);
 
 // Swagger API Documentation
@@ -155,17 +172,42 @@ const specs = swaggerJsdoc(swaggerOptions);
 
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(specs));
 
+/**
+ * @openapi
+ * /health:
+ *   get:
+ *     summary: Public liveness probe
+ *     description: Returns the overall status and pool utilization. Use /api/admin/health for full diagnostics.
+ *     tags: [Health]
+ *     responses:
+ *       200:
+ *         description: Service is healthy
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status:
+ *                   type: string
+ *                   enum: [ok, degraded]
+ *                 pool:
+ *                   type: object
+ *                   properties:
+ *                     total: { type: integer }
+ *                     idle: { type: integer }
+ *                     waiting: { type: integer }
+ *       503:
+ *         description: Service is degraded
+ */
 app.get('/health', async (req, res) => {
   try {
-    const body = await runHealthChecks();
-    res.status(body.status === 'ok' ? 200 : 503).json(body);
-  } catch {
-    res.status(503).json({
-      status: 'degraded',
-      db: 'down',
-      stellar: 'down',
-      network: process.env.STELLAR_NETWORK || 'testnet',
+    const health = await runHealthChecks();
+    res.status(health.status === 'ok' ? 200 : 503).json({
+      status: health.status,
+      pool: health.pool,
     });
+  } catch {
+    res.status(503).json({ status: 'degraded' });
   }
 });
 

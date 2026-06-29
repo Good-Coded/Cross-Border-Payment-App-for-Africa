@@ -258,6 +258,48 @@ node-pg-migrate tracks applied migrations in a `pgmigrations` table that it crea
 | POST   | /api/support/tickets      | Yes  | Create a support/dispute ticket    |
 | GET    | /api/support/tickets      | Yes  | List user's support tickets        |
 | POST   | /api/admin/clawback       | Admin| Clawback asset for compliance      |
+| GET    | /api/admin/health         | Admin| Full service health diagnostics    |
+| POST   | /api/escrow/create        | Yes  | Create agent escrow (approved agents only) |
+| POST   | /api/escrow/:id/confirm   | Yes  | Agent confirms payout              |
+| POST   | /api/escrow/:id/cancel    | Yes  | Sender cancels escrow              |
+
+---
+
+## Agent Registration and Approval
+
+AfriPay uses a registered agent network for fiat distribution. Only **approved** agents may be used as the `agent_wallet` parameter in `POST /api/escrow/create`.
+
+### Agent Lifecycle
+
+```
+1. Agent applies → POST /api/auth/register (creates a user account)
+2. Agent submits their Stellar wallet address for approval
+3. Admin reviews and approves → INSERT INTO agents (wallet_address, status='approved')
+4. Agent is now eligible to receive escrow assignments
+5. Admin may suspend an agent by setting status='suspended'
+```
+
+### agents Table
+
+| Column           | Type        | Description                              |
+|------------------|-------------|------------------------------------------|
+| id               | uuid        | Primary key                              |
+| user_id          | uuid        | FK to users table                        |
+| wallet_address   | text        | Agent's Stellar public key (unique)      |
+| status           | varchar(20) | `pending` / `approved` / `suspended`     |
+| country          | varchar(10) | ISO country code (optional)              |
+| created_at       | timestamptz | Registration timestamp                   |
+| approved_at      | timestamptz | Admin approval timestamp                 |
+
+### Validation
+
+`POST /api/escrow/create` checks the `agents` table before creating any on-chain escrow:
+
+- If `agent_wallet` is not found with `status = 'approved'`, the request is rejected with HTTP 400:
+  ```json
+  { "error": "Agent is not registered in the AfriPay network" }
+  ```
+- Only after a successful agent lookup does the backend proceed to sign and broadcast the Soroban escrow transaction.
 
 ---
 
@@ -282,6 +324,13 @@ STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org
 # AES-256 encryption key for private key storage (must be exactly 32 characters)
 ENCRYPTION_KEY=your_32_character_encryption_key_
 
+# Cache Configuration
+# Balance cache TTL in seconds (default: 30)
+# Time-To-Live for cached wallet balance data. Lower values ensure fresher data but increase load on Horizon.
+# Higher values reduce load but may show stale balances after recent transactions.
+# Cache is automatically invalidated after send, sendBatch, and sendPath operations.
+BALANCE_CACHE_TTL_SECONDS=30
+
 # CORS
 FRONTEND_URL=http://localhost:3000
 ```
@@ -299,6 +348,24 @@ FRONTEND_URL=http://localhost:3000
 - Fraud protection: blocks wallets exceeding 5 transactions in 10 minutes
 - Input validation on all endpoints via `express-validator`
 - CORS restricted to configured frontend origin
+
+---
+
+## Performance & Caching
+
+**Balance Caching with Redis**
+
+Wallet balances are cached in Redis to reduce load on the Stellar Horizon API. The cache behavior is configurable:
+
+- **Configurable TTL**: Set `BALANCE_CACHE_TTL_SECONDS` in your environment (default: 30 seconds)
+- **Automatic Invalidation**: Cache is cleared immediately after:
+  - Standard payments (`POST /api/payments`)
+  - Batch payments (`POST /api/payments/batch`)
+  - Path payments (`POST /api/payments/send-path`)
+- **Fallback Behavior**: If Redis is not configured, balances are fetched live from Horizon on every request
+- **Stale Balance Risk**: In production, ensure the TTL is low enough (15-30 seconds recommended) to prevent users from seeing significantly stale balances after receiving payments
+
+To adjust the cache TTL in production, update the `BALANCE_CACHE_TTL_SECONDS` environment variable without restarting (if using a process manager with hot-reload support).
 
 ---
 

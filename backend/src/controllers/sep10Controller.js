@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { generateChallenge, verifyChallenge } = require('../services/sep10');
+const { networkPassphrase } = require('../services/stellar');
 const db = require('../db');
 
 async function getChallenge(req, res, next) {
@@ -18,21 +19,23 @@ async function getChallenge(req, res, next) {
 
 async function postChallenge(req, res, next) {
   try {
-    const { transaction } = req.body;
+    const { transaction, network_passphrase } = req.body;
     if (!transaction) {
       return res.status(400).json({ error: 'transaction required' });
     }
 
+    if (network_passphrase !== networkPassphrase) {
+      return res.status(400).json({ error: 'Invalid network passphrase' });
+    }
+
     // Extract account from transaction
     const StellarSDK = require('@stellar/stellar-sdk');
-    const tx = StellarSDK.TransactionEnvelope.fromXDR(
-      transaction,
-      process.env.STELLAR_NETWORK === 'mainnet'
-        ? StellarSDK.Networks.PUBLIC_NETWORK_PASSPHRASE
-        : StellarSDK.Networks.TESTNET_NETWORK_PASSPHRASE
-    );
+    const passphrase = process.env.STELLAR_NETWORK === 'mainnet'
+      ? StellarSDK.Networks.PUBLIC
+      : StellarSDK.Networks.TESTNET;
+    const tx = StellarSDK.TransactionBuilder.fromXDR(transaction, passphrase);
 
-    const account = tx.transaction().source.accountId();
+    const account = tx.source;
 
     // Verify the challenge
     const isValid = verifyChallenge(account, transaction);

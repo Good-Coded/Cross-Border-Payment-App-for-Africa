@@ -3,8 +3,34 @@ const { body, validationResult } = require('express-validator');
 const StellarSdk = require('@stellar/stellar-sdk');
 const authMiddleware = require('../middleware/auth');
 const isAdmin = require('../middleware/isAdmin');
-const { getStats, getUsers, getTransactions, clawback, approveKYC, revokeKYC } = require('../controllers/adminController');
-const { getStats, getUsers, getTransactions, clawback, approveKYC, revokeKYC, setWalletFlags } = require('../controllers/adminController');
+const ipAllowlist = require('../middleware/ipAllowlist');
+const { issueTokens } = require('../controllers/assetController');
+const {
+  getStats,
+  getUsers,
+  getTransactions,
+  getDailyTransactionStats,
+  getStellarNetworkStats,
+  clawback,
+  approveKYC,
+  revokeKYC,
+  setWalletFlags,
+  announceContractUpgrade,
+  executeContractUpgrade,
+  getContractUpgradeStatus,
+  getContractEventsEndpoint,
+  getContractEventsGlobalEndpoint,
+  indexContractEventsEndpoint,
+  getFraudRules,
+  createFraudRule,
+  updateFraudRule,
+  bulkSuspend,
+  bulkUnsuspend,
+  bulkExport,
+  getJobStatus,
+  bulkKycUpdate,
+} = require('../controllers/adminController');
+const { getDeadLetterNotifications } = require('../controllers/notificationController');
 
 const validate = (req, res, next) => {
   const errors = validationResult(req);
@@ -12,12 +38,43 @@ const validate = (req, res, next) => {
   next();
 };
 
+router.use(ipAllowlist);
 router.use(authMiddleware);
 router.use(isAdmin);
 
+/**
+ * @openapi
+ * /api/admin/health:
+ *   get:
+ *     summary: Full health diagnostics (admin only)
+ *     description: Returns detailed service health including DB, Stellar, network, and pool stats.
+ *     tags: [Admin]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: All services healthy
+ *       503:
+ *         description: One or more services degraded
+ *       403:
+ *         description: Admin access required
+ */
+router.get('/health', async (req, res) => {
+  const { runHealthChecks } = require('../services/health');
+  try {
+    const body = await runHealthChecks();
+    res.status(body.status === 'ok' ? 200 : 503).json(body);
+  } catch {
+    res.status(503).json({ status: 'degraded', db: 'down', stellar: 'down' });
+  }
+});
+
 router.get('/stats', getStats);
+router.get('/daily-stats', getDailyTransactionStats);
 router.get('/users', getUsers);
 router.get('/transactions', getTransactions);
+router.get('/stellar-stats', getStellarNetworkStats);
+router.post('/assets/issue', issueTokens);
 
 router.post('/clawback',
  *   post:
@@ -66,10 +123,10 @@ router.post('/clawback',
         return true;
       }),
     body('asset').trim().notEmpty().withMessage('asset is required')
-      .isAlphanumeric().isLength({ max: 12 }).withMessage('Invalid asset code'),
+      .isIn(['USDC', 'XLM']).withMessage('asset must be USDC or XLM'),
     body('amount').notEmpty().withMessage('amount is required')
-      .isFloat({ gt: 0 }).withMessage('amount must be greater than 0'),
-    body('reason').optional().trim().isLength({ max: 500 }),
+      .isFloat({ gt: 0.0000001 }).withMessage('amount must be greater than 0.0000001'),
+    body('reason').optional().trim().isLength({ max: 500 }).withMessage('reason must be 500 characters or fewer'),
   ],
   validate,
   clawback
@@ -87,5 +144,114 @@ router.post(
   validate,
   setWalletFlags,
 );
+
+/**
+ * Contract Upgrade Routes (Issues #148)
+ */
+router.post(
+  '/contracts/:contractId/upgrade',
+  [
+    body('wasmHash')
+      .notEmpty().withMessage('wasmHash is required')
+      .matches(/^[a-f0-9]{64}$/).withMessage('Invalid WASM hash format (must be valid SHA256)'),
+    body('description').optional().trim().isLength({ max: 1000 }),
+  ],
+  validate,
+  announceContractUpgrade
+);
+
+router.post(
+  '/contracts/:contractId/upgrade/execute',
+  [
+    body('wasmHash')
+      .notEmpty().withMessage('wasmHash is required')
+      .matches(/^[a-f0-9]{64}$/).withMessage('Invalid WASM hash format'),
+  ],
+  validate,
+  executeContractUpgrade
+);
+
+router.get('/contracts/:contractId/upgrade/status', getContractUpgradeStatus);
+
+/**
+ * Contract Events Routes (Issue #147, #527)
+ */
+router.get('/contracts/events', getContractEventsGlobalEndpoint);
+router.get('/contracts/:contractId/events', getContractEventsEndpoint);
+
+router.post(
+  '/contracts/:contractId/events/index',
+  [
+    body('contractName').optional().trim().isLength({ max: 100 }),
+  ],
+  validate,
+  indexContractEventsEndpoint
+);
+
+// ---------------------------------------------------------------------------
+// Fraud Rule Engine (#690)
+// ---------------------------------------------------------------------------
+router.get('/fraud-rules', getFraudRules);
+
+router.post('/fraud-rules',
+  [
+    body('name').trim().notEmpty().isLength({ max: 100 }),
+    body('rule_type').isIn(['velocity', 'amount', 'daily_limit']),
+    body('parameters').isObject(),
+  ],
+  validate,
+  createFraudRule
+);
+
+router.patch('/fraud-rules/:id',
+  [
+    body('name').optional().trim().isLength({ max: 100 }),
+    body('parameters').optional().isObject(),
+    body('is_active').optional().isBoolean(),
+  ],
+  validate,
+  updateFraudRule
+);
+
+// ---------------------------------------------------------------------------
+// Bulk User Management (#692)
+// ---------------------------------------------------------------------------
+router.post('/users/bulk-suspend',
+  [
+    body('userIds').isArray({ min: 1 }),
+    body('reason').optional().trim().isLength({ max: 500 }),
+  ],
+  validate,
+  bulkSuspend
+);
+
+router.post('/users/bulk-unsuspend',
+  [body('userIds').isArray({ min: 1 })],
+  validate,
+  bulkUnsuspend
+);
+
+router.post('/users/bulk-export',
+  [body('userIds').isArray({ min: 1 })],
+  validate,
+  bulkExport
+);
+
+router.post('/users/bulk-kyc-update',
+  [
+    body('userIds').isArray({ min: 1 }),
+    body('status').isIn(['approved', 'rejected']),
+    body('reason').optional().trim().isLength({ max: 500 }),
+  ],
+  validate,
+  bulkKycUpdate
+);
+
+router.get('/jobs/:jobId', getJobStatus);
+
+// ---------------------------------------------------------------------------
+// Dead-letter notifications (#693)
+// ---------------------------------------------------------------------------
+router.get('/notifications/dead-letter', getDeadLetterNotifications);
 
 module.exports = router;

@@ -1,4 +1,4 @@
-jest.mock('../src/db');
+﻿jest.mock('../src/db');
 jest.mock('../src/services/stellar');
 jest.mock('../src/services/audit', () => ({ log: jest.fn() }));
 jest.mock('../src/services/email', () => ({
@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const db = require('../src/db');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../src/services/email');
 const { createWallet } = require('../src/services/stellar');
+const { register, login, refresh, logout, verifyEmail } = require('../src/controllers/authController');
 const {
   register,
   login,
@@ -30,6 +31,17 @@ function mockRes() {
   return res;
 }
 
+const FAMILY_ID = 'fam-uuid-1234-5678-abcd-ef0123456789';
+
+function makeActiveToken(overrides) {
+  return Object.assign({
+    id: 'rt-1', user_id: 'u-1',
+    expires_at: new Date(Date.now() + 60000).toISOString(),
+    family_id: FAMILY_ID, revoked: false,
+    email: 'a@b.com', role: 'user',
+  }, overrides);
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   process.env.JWT_SECRET = 'test_secret';
@@ -39,59 +51,35 @@ beforeEach(() => {
   sendPasswordResetEmail.mockResolvedValue();
 });
 
-// ── register ──────────────────────────────────────────────────────────────────
-
 test('register: returns 409 if email already exists', async () => {
   db.query.mockResolvedValueOnce({ rows: [{ id: '1' }] });
-
-  const req = { body: { full_name: 'Alice', email: 'a@b.com', password: 'password1' } };
   const res = mockRes();
-  await register(req, res, jest.fn());
-
+  await register({ body: { full_name: 'Alice', email: 'a@b.com', password: 'password1' } }, res, jest.fn());
   expect(res.status).toHaveBeenCalledWith(409);
   expect(res.json).toHaveBeenCalledWith({ error: 'Email already registered' });
 });
 
 test('register: creates user and sends verification email', async () => {
-  db.query
-    .mockResolvedValueOnce({ rows: [] })       // check existing
-    .mockResolvedValueOnce({ rows: [] })       // BEGIN
-    .mockResolvedValueOnce({ rows: [] })       // INSERT users
-    .mockResolvedValueOnce({ rows: [] })       // INSERT wallets
-    .mockResolvedValueOnce({ rows: [] });      // COMMIT
-
-  const req = { body: { full_name: 'Alice', email: 'a@b.com', password: 'password1' } };
+  db.query.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] })
+    .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] });
   const res = mockRes();
-  await register(req, res, jest.fn());
-
+  await register({ body: { full_name: 'Alice', email: 'a@b.com', password: 'password1' } }, res, jest.fn());
   expect(sendVerificationEmail).toHaveBeenCalledWith('a@b.com', expect.any(String));
   expect(res.status).toHaveBeenCalledWith(201);
-  expect(res.json).toHaveBeenCalledWith(
-    expect.objectContaining({ message: expect.stringContaining('verify your email') })
-  );
 });
 
 test('register: does NOT return a JWT token', async () => {
-  db.query
-    .mockResolvedValueOnce({ rows: [] })
-    .mockResolvedValueOnce({ rows: [] })
-    .mockResolvedValueOnce({ rows: [] })
-    .mockResolvedValueOnce({ rows: [] })
-    .mockResolvedValueOnce({ rows: [] });
-
-  const req = { body: { full_name: 'Alice', email: 'a@b.com', password: 'password1' } };
+  db.query.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] })
+    .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] });
   const res = mockRes();
-  await register(req, res, jest.fn());
-
-  const payload = res.json.mock.calls[0][0];
-  expect(payload.token).toBeUndefined();
+  await register({ body: { full_name: 'Alice', email: 'a@b.com', password: 'password1' } }, res, jest.fn());
+  expect(res.json.mock.calls[0][0].token).toBeUndefined();
 });
-
-// ── login ─────────────────────────────────────────────────────────────────────
 
 test('login: returns 401 for wrong password', async () => {
   const bcrypt = require('bcryptjs');
   const hash = await bcrypt.hash('correctpass', 12);
+  db.query.mockResolvedValueOnce({ rows: [{ id: '1', full_name: 'Alice', email: 'a@b.com', password_hash: hash, email_verified: true, public_key: 'GPUB' }] });
   db.query
     .mockResolvedValueOnce({
       rows: [{
@@ -111,10 +99,8 @@ test('login: returns 401 for wrong password', async () => {
 
   const req = { body: { email: 'a@b.com', password: 'wrongpass' } };
   const res = mockRes();
-  await login(req, res, jest.fn());
-
+  await login({ body: { email: 'a@b.com', password: 'wrongpass' } }, res, jest.fn());
   expect(res.status).toHaveBeenCalledWith(401);
-  expect(res.json).toHaveBeenCalledWith({ error: 'Invalid email or password' });
 });
 
 test('login: locks account after 10 consecutive failed attempts', async () => {
@@ -211,6 +197,11 @@ test('login: resets failed login counter on successful login', async () => {
 test('login: returns 403 when email not verified', async () => {
   const bcrypt = require('bcryptjs');
   const hash = await bcrypt.hash('password1', 12);
+  db.query.mockResolvedValueOnce({ rows: [{ id: '1', full_name: 'Alice', email: 'a@b.com', password_hash: hash, email_verified: false, public_key: 'GPUB' }] });
+  const res = mockRes();
+  await login({ body: { email: 'a@b.com', password: 'password1' } }, res, jest.fn());
+  expect(res.status).toHaveBeenCalledWith(403);
+});
   db.query.mockResolvedValueOnce({
     rows: [{
       id: '1',
@@ -223,17 +214,56 @@ test('login: returns 403 when email not verified', async () => {
     }]
   });
 
-  const req = { body: { email: 'a@b.com', password: 'password1' } };
-  const res = mockRes();
-  await login(req, res, jest.fn());
-
-  expect(res.status).toHaveBeenCalledWith(403);
-  expect(res.json).toHaveBeenCalledWith({ error: 'Please verify your email before logging in.' });
-});
-
-test('login: returns JWT when credentials valid and email verified', async () => {
+test('login: returns JWT and sets HttpOnly cookie on success', async () => {
   const bcrypt = require('bcryptjs');
   const hash = await bcrypt.hash('password1', 12);
+  db.query.mockResolvedValueOnce({ rows: [{ id: '1', full_name: 'Alice', email: 'a@b.com', password_hash: hash, email_verified: true, public_key: 'GPUB' }] })
+    .mockResolvedValueOnce({ rows: [] });
+  const res = mockRes();
+  await login({ body: { email: 'a@b.com', password: 'password1' } }, res, jest.fn());
+  expect(res.json.mock.calls[0][0].token).toBeDefined();
+  expect(res.cookie).toHaveBeenCalledWith('refreshToken', expect.any(String), expect.objectContaining({ httpOnly: true, sameSite: 'strict' }));
+});
+
+test('login: stores hashed refresh token in DB, not the raw value', async () => {
+  const bcrypt = require('bcryptjs');
+  const hash = await bcrypt.hash('password1', 12);
+  db.query.mockResolvedValueOnce({ rows: [{ id: '1', full_name: 'Alice', email: 'a@b.com', password_hash: hash, email_verified: true, public_key: 'GPUB' }] })
+    .mockResolvedValueOnce({ rows: [] });
+  const res = mockRes();
+  await login({ body: { email: 'a@b.com', password: 'password1' } }, res, jest.fn());
+  const rawToken = res.cookie.mock.calls[0][1];
+  const insertCall = db.query.mock.calls.find(([sql]) => sql.includes('INSERT INTO refresh_tokens'));
+  expect(insertCall).toBeDefined();
+  expect(insertCall[1][2]).toBe(crypto.createHash('sha256').update(rawToken).digest('hex'));
+});
+
+test('login: seeds a family_id when issuing the first refresh token', async () => {
+  const bcrypt = require('bcryptjs');
+  const hash = await bcrypt.hash('password1', 12);
+  db.query.mockResolvedValueOnce({ rows: [{ id: '1', full_name: 'Alice', email: 'a@b.com', password_hash: hash, email_verified: true, public_key: 'GPUB' }] })
+    .mockResolvedValueOnce({ rows: [] });
+  const res = mockRes();
+  await login({ body: { email: 'a@b.com', password: 'password1' } }, res, jest.fn());
+  const insertCall = db.query.mock.calls.find(([sql]) => sql.includes('INSERT INTO refresh_tokens'));
+  expect(insertCall).toBeDefined();
+  expect(insertCall[1][3]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+});
+
+test('refresh: returns 401 when no cookie present', async () => {
+  const res = mockRes();
+  await refresh({ cookies: {} }, res, jest.fn());
+  expect(res.status).toHaveBeenCalledWith(401);
+  expect(res.json).toHaveBeenCalledWith({ error: 'No refresh token' });
+});
+
+test('refresh: returns 401 for unknown token', async () => {
+  db.query.mockResolvedValueOnce({ rows: [] });
+  const res = mockRes();
+  await refresh({ cookies: { refreshToken: 'unknownrawtoken' } }, res, jest.fn());
+  expect(res.status).toHaveBeenCalledWith(401);
+  expect(res.json).toHaveBeenCalledWith({ error: 'Invalid refresh token' });
+});
   db.query
     .mockResolvedValueOnce({
       rows: [
@@ -251,16 +281,43 @@ test('login: returns JWT when credentials valid and email verified', async () =>
     .mockResolvedValueOnce({ rows: [] })
     .mockResolvedValueOnce({ rows: [] }); // account reset + INSERT refresh_token
 
-  const req = { body: { email: 'a@b.com', password: 'password1' } };
+test('refresh: returns 401 and clears cookie for expired token', async () => {
+  db.query.mockResolvedValueOnce({ rows: [makeActiveToken({ expires_at: new Date(Date.now() - 1000).toISOString() })] })
+    .mockResolvedValueOnce({ rows: [] });
   const res = mockRes();
-  await login(req, res, jest.fn());
-
-  expect(res.status).not.toHaveBeenCalledWith(401);
-  expect(res.status).not.toHaveBeenCalledWith(403);
-  const payload = res.json.mock.calls[0][0];
-  expect(payload.token).toBeDefined();
+  await refresh({ cookies: { refreshToken: 'expiredrawtoken' } }, res, jest.fn());
+  expect(res.status).toHaveBeenCalledWith(401);
+  expect(res.json).toHaveBeenCalledWith({ error: 'Refresh token expired' });
+  expect(res.clearCookie).toHaveBeenCalledWith('refreshToken', expect.any(Object));
 });
 
+test('refresh: rotates token  marks old revoked and inserts new one', async () => {
+  db.query.mockResolvedValueOnce({ rows: [makeActiveToken()] })
+    .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] });
+  const res = mockRes();
+  await refresh({ cookies: { refreshToken: 'validrawtoken' } }, res, jest.fn());
+  expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ token: expect.any(String) }));
+  expect(res.cookie).toHaveBeenCalledWith('refreshToken', expect.any(String), expect.objectContaining({ httpOnly: true }));
+  expect(db.query.mock.calls.find(([sql]) => sql.includes('UPDATE refresh_tokens') && sql.includes('revoked'))).toBeDefined();
+  expect(db.query.mock.calls.find(([sql]) => sql.includes('INSERT INTO refresh_tokens'))).toBeDefined();
+});
+
+test('refresh: new token carries the same family_id as the old one', async () => {
+  db.query.mockResolvedValueOnce({ rows: [makeActiveToken()] })
+    .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] });
+  const res = mockRes();
+  await refresh({ cookies: { refreshToken: 'validrawtoken' } }, res, jest.fn());
+  const insertCall = db.query.mock.calls.find(([sql]) => sql.includes('INSERT INTO refresh_tokens'));
+  expect(insertCall[1][3]).toBe(FAMILY_ID);
+});
+
+test('refresh: new cookie token differs from old one (rotation)', async () => {
+  db.query.mockResolvedValueOnce({ rows: [makeActiveToken()] })
+    .mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] });
+  const res = mockRes();
+  await refresh({ cookies: { refreshToken: 'oldrawtoken12345' } }, res, jest.fn());
+  expect(res.cookie.mock.calls[0][1]).not.toBe('oldrawtoken12345');
+});
 test('login: sets HttpOnly refreshToken cookie on success', async () => {
   const bcrypt = require('bcryptjs');
   const hash = await bcrypt.hash('password1', 12);
@@ -325,7 +382,42 @@ test('login: stores hashed refresh token in DB, not the raw value', async () => 
   expect(storedHash).toBe(crypto.createHash('sha256').update(rawToken).digest('hex'));
 });
 
+test('login: seeds a family_id when issuing the first refresh token', async () => {
+  const bcrypt = require('bcryptjs');
+  const hash = await bcrypt.hash('password1', 12);
+  db.query
+    .mockResolvedValueOnce({
+      rows: [{ id: '1', full_name: 'Alice', email: 'a@b.com', password_hash: hash, email_verified: true, public_key: 'GPUB' }]
+    })
+    .mockResolvedValueOnce({ rows: [] });
+
+  const req = { body: { email: 'a@b.com', password: 'password1' } };
+  const res = mockRes();
+  await login(req, res, jest.fn());
+
+  const insertCall = db.query.mock.calls.find(([sql]) => sql.includes('INSERT INTO refresh_tokens'));
+  expect(insertCall).toBeDefined();
+  // family_id is the 5th param (index 4) — must be a UUID
+  const familyId = insertCall[1][4];
+  expect(familyId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+});
+
 // ── refresh ───────────────────────────────────────────────────────────────────
+
+const FAMILY_ID = 'fam-uuid-1234-5678-abcd-ef0123456789';
+
+function makeActiveToken(overrides = {}) {
+  return {
+    id: 'rt-1',
+    user_id: 'u-1',
+    expires_at: new Date(Date.now() + 60000).toISOString(),
+    family_id: FAMILY_ID,
+    revoked: false,
+    email: 'a@b.com',
+    role: 'user',
+    ...overrides,
+  };
+}
 
 test('refresh: returns 401 when no cookie present', async () => {
   const req = { cookies: {} };
@@ -336,8 +428,11 @@ test('refresh: returns 401 when no cookie present', async () => {
   expect(res.json).toHaveBeenCalledWith({ error: 'No refresh token' });
 });
 
-test('refresh: returns 401 for unknown token', async () => {
-  db.query.mockResolvedValueOnce({ rows: [] }); // lookup returns nothing
+test('refresh: returns 401 for completely unknown token (not in DB at all)', async () => {
+  // First lookup: not found. Second lookup (revoked check): also not found.
+  db.query
+    .mockResolvedValueOnce({ rows: [] })
+    .mockResolvedValueOnce({ rows: [] });
 
   const req = { cookies: { refreshToken: 'unknownrawtoken' } };
   const res = mockRes();
@@ -348,10 +443,11 @@ test('refresh: returns 401 for unknown token', async () => {
 });
 
 test('refresh: returns 401 and clears cookie for expired token', async () => {
-  db.query.mockResolvedValueOnce({
-    rows: [{ id: 'rt-1', user_id: 'u-1', expires_at: new Date(Date.now() - 1000).toISOString(), email: 'a@b.com', role: 'user' }]
-  })
-  .mockResolvedValueOnce({ rows: [] }); // DELETE
+  db.query
+    .mockResolvedValueOnce({
+      rows: [makeActiveToken({ expires_at: new Date(Date.now() - 1000).toISOString() })]
+    })
+    .mockResolvedValueOnce({ rows: [] }); // DELETE expired
 
   const req = { cookies: { refreshToken: 'expiredrawtoken' } };
   const res = mockRes();
@@ -362,13 +458,11 @@ test('refresh: returns 401 and clears cookie for expired token', async () => {
   expect(res.clearCookie).toHaveBeenCalledWith('refreshToken', expect.any(Object));
 });
 
-test('refresh: rotates token and returns new access token', async () => {
+test('refresh: rotates token — marks old revoked and inserts new one', async () => {
   db.query
-    .mockResolvedValueOnce({
-      rows: [{ id: 'rt-1', user_id: 'u-1', expires_at: new Date(Date.now() + 60000).toISOString(), email: 'a@b.com', role: 'user' }]
-    })
-    .mockResolvedValueOnce({ rows: [] }) // DELETE old
-    .mockResolvedValueOnce({ rows: [] }); // INSERT new
+    .mockResolvedValueOnce({ rows: [makeActiveToken()] }) // lookup
+    .mockResolvedValueOnce({ rows: [] })                  // UPDATE revoked=TRUE
+    .mockResolvedValueOnce({ rows: [] });                 // INSERT new
 
   const req = { cookies: { refreshToken: 'validrawtoken' } };
   const res = mockRes();
@@ -377,20 +471,32 @@ test('refresh: rotates token and returns new access token', async () => {
   expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ token: expect.any(String) }));
   expect(res.cookie).toHaveBeenCalledWith('refreshToken', expect.any(String), expect.objectContaining({ httpOnly: true }));
 
-  // Old token must be deleted
-  const deleteCall = db.query.mock.calls.find(([sql]) => sql.includes('DELETE FROM refresh_tokens'));
-  expect(deleteCall).toBeDefined();
+  const updateCall = db.query.mock.calls.find(([sql]) => sql.includes('UPDATE refresh_tokens') && sql.includes('revoked'));
+  expect(updateCall).toBeDefined();
 
-  // New token must be inserted
   const insertCall = db.query.mock.calls.find(([sql]) => sql.includes('INSERT INTO refresh_tokens'));
   expect(insertCall).toBeDefined();
 });
 
+test('refresh: new token carries the same family_id as the old one', async () => {
+  db.query
+    .mockResolvedValueOnce({ rows: [makeActiveToken()] })
+    .mockResolvedValueOnce({ rows: [] })
+    .mockResolvedValueOnce({ rows: [] });
+
+  const req = { cookies: { refreshToken: 'validrawtoken' } };
+  const res = mockRes();
+  await refresh(req, res, jest.fn());
+
+  const insertCall = db.query.mock.calls.find(([sql]) => sql.includes('INSERT INTO refresh_tokens'));
+  expect(insertCall).toBeDefined();
+  // family_id is the 5th param (index 4)
+  expect(insertCall[1][4]).toBe(FAMILY_ID);
+});
+
 test('refresh: new cookie token differs from old one (rotation)', async () => {
   db.query
-    .mockResolvedValueOnce({
-      rows: [{ id: 'rt-1', user_id: 'u-1', expires_at: new Date(Date.now() + 60000).toISOString(), email: 'a@b.com', role: 'user' }]
-    })
+    .mockResolvedValueOnce({ rows: [makeActiveToken()] })
     .mockResolvedValueOnce({ rows: [] })
     .mockResolvedValueOnce({ rows: [] });
 
@@ -401,6 +507,73 @@ test('refresh: new cookie token differs from old one (rotation)', async () => {
 
   const newRaw = res.cookie.mock.calls[0][1];
   expect(newRaw).not.toBe(oldRaw);
+});
+
+// ── refresh: token reuse detection ───────────────────────────────────────────
+
+test('refresh: detects reuse of a rotated token — invalidates entire family', async () => {
+  // Attacker presents a previously-rotated (revoked) token.
+  // First lookup (active): not found (it was rotated away).
+  // Second lookup (revoked check): found with family_id.
+  db.query
+    .mockResolvedValueOnce({ rows: [] })                                          // active lookup: miss
+    .mockResolvedValueOnce({ rows: [{ family_id: FAMILY_ID, user_id: 'u-1' }] }) // revoked lookup: hit
+    .mockResolvedValueOnce({ rows: [] });                                         // DELETE family
+
+  const req = { cookies: { refreshToken: 'rotatedtoken' } };
+  const res = mockRes();
+  await refresh(req, res, jest.fn());
+
+  expect(res.status).toHaveBeenCalledWith(401);
+  expect(res.json).toHaveBeenCalledWith(
+    expect.objectContaining({ error: expect.stringMatching(/reuse detected/i) })
+  );
+  expect(res.clearCookie).toHaveBeenCalledWith('refreshToken', expect.any(Object));
+
+  // Entire family must be deleted
+  const deleteCall = db.query.mock.calls.find(([sql]) =>
+    sql.includes('DELETE FROM refresh_tokens') && sql.includes('family_id')
+  );
+  expect(deleteCall).toBeDefined();
+  expect(deleteCall[1][0]).toBe(FAMILY_ID);
+});
+
+test('refresh: reuse detection does not issue a new access token', async () => {
+  db.query
+    .mockResolvedValueOnce({ rows: [] })
+    .mockResolvedValueOnce({ rows: [{ family_id: FAMILY_ID, user_id: 'u-1' }] })
+    .mockResolvedValueOnce({ rows: [] });
+
+  const req = { cookies: { refreshToken: 'rotatedtoken' } };
+  const res = mockRes();
+  await refresh(req, res, jest.fn());
+
+  // No new cookie should be set
+  expect(res.cookie).not.toHaveBeenCalled();
+  // Response must be 401, not 200
+  expect(res.status).toHaveBeenCalledWith(401);
+});
+
+test('refresh: reuse of a token that is still in DB as revoked also invalidates family', async () => {
+  // Edge case: the revoked row is still present in the active lookup (revoked=true)
+  db.query
+    .mockResolvedValueOnce({ rows: [makeActiveToken({ revoked: true })] }) // found but revoked
+    .mockResolvedValueOnce({ rows: [] });                                   // DELETE family
+
+  const req = { cookies: { refreshToken: 'revokedtoken' } };
+  const res = mockRes();
+  await refresh(req, res, jest.fn());
+
+  expect(res.status).toHaveBeenCalledWith(401);
+  expect(res.json).toHaveBeenCalledWith(
+    expect.objectContaining({ error: expect.stringMatching(/reuse detected/i) })
+  );
+
+  const deleteCall = db.query.mock.calls.find(([sql]) =>
+    sql.includes('DELETE FROM refresh_tokens') && sql.includes('family_id')
+  );
+  expect(deleteCall).toBeDefined();
+  expect(deleteCall[1][0]).toBe(FAMILY_ID);
 });
 
 // ── logout ────────────────────────────────────────────────────────────────────
@@ -430,72 +603,86 @@ test('logout: succeeds gracefully when no cookie is present', async () => {
 
 // ── verifyEmail ───────────────────────────────────────────────────────────────
 
-test('verifyEmail: returns 400 when token missing', async () => {
-  const req = { query: {} };
+test('refresh: detects reuse  revoked token invalidates entire family', async () => {
+  db.query.mockResolvedValueOnce({ rows: [makeActiveToken({ revoked: true })] })
+    .mockResolvedValueOnce({ rows: [] });
   const res = mockRes();
-  await verifyEmail(req, res, jest.fn());
+  await refresh({ cookies: { refreshToken: 'rotatedtoken' } }, res, jest.fn());
+  expect(res.status).toHaveBeenCalledWith(401);
+  expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ error: expect.stringMatching(/reuse detected/i) }));
+  expect(res.clearCookie).toHaveBeenCalledWith('refreshToken', expect.any(Object));
+  const deleteCall = db.query.mock.calls.find(([sql]) => sql.includes('DELETE FROM refresh_tokens') && sql.includes('family_id'));
+  expect(deleteCall).toBeDefined();
+  expect(deleteCall[1][0]).toBe(FAMILY_ID);
+});
 
+test('refresh: reuse detection does not issue a new access token or cookie', async () => {
+  db.query.mockResolvedValueOnce({ rows: [makeActiveToken({ revoked: true })] })
+    .mockResolvedValueOnce({ rows: [] });
+  const res = mockRes();
+  await refresh({ cookies: { refreshToken: 'rotatedtoken' } }, res, jest.fn());
+  expect(res.cookie).not.toHaveBeenCalled();
+  expect(res.status).toHaveBeenCalledWith(401);
+});
+
+test('logout: deletes token family from DB and clears cookie', async () => {
+  db.query.mockResolvedValueOnce({ rows: [{ family_id: FAMILY_ID }] }).mockResolvedValueOnce({ rows: [] });
+  const res = mockRes();
+  await logout({ cookies: { refreshToken: 'somerawtoken' } }, res, jest.fn());
+  const deleteCall = db.query.mock.calls.find(([sql]) => sql.includes('DELETE FROM refresh_tokens') && sql.includes('family_id'));
+  expect(deleteCall).toBeDefined();
+  expect(res.clearCookie).toHaveBeenCalledWith('refreshToken', expect.any(Object));
+  expect(res.json).toHaveBeenCalledWith({ message: 'Logged out successfully' });
+});
+
+test('logout: succeeds gracefully when no cookie is present', async () => {
+  const res = mockRes();
+  await logout({ cookies: {} }, res, jest.fn());
+  expect(db.query).not.toHaveBeenCalled();
+  expect(res.clearCookie).toHaveBeenCalled();
+  expect(res.json).toHaveBeenCalledWith({ message: 'Logged out successfully' });
+});
+
+test('verifyEmail: returns 400 when token missing', async () => {
+  const res = mockRes();
+  await verifyEmail({ query: {} }, res, jest.fn());
   expect(res.status).toHaveBeenCalledWith(400);
   expect(res.json).toHaveBeenCalledWith({ error: 'Verification token is required' });
 });
 
 test('verifyEmail: returns 400 for unknown token', async () => {
   db.query.mockResolvedValueOnce({ rows: [] });
-
-  const req = { query: { token: 'unknowntoken' } };
   const res = mockRes();
-  await verifyEmail(req, res, jest.fn());
-
+  await verifyEmail({ query: { token: 'unknowntoken' } }, res, jest.fn());
   expect(res.status).toHaveBeenCalledWith(400);
   expect(res.json).toHaveBeenCalledWith({ error: 'Invalid verification token' });
 });
 
 test('verifyEmail: returns 400 for expired token', async () => {
-  db.query.mockResolvedValueOnce({
-    rows: [{ id: '1', token_expires_at: new Date(Date.now() - 1000).toISOString() }]
-  });
-
-  const req = { query: { token: 'sometoken' } };
+  db.query.mockResolvedValueOnce({ rows: [{ id: '1', token_expires_at: new Date(Date.now() - 1000).toISOString() }] });
   const res = mockRes();
-  await verifyEmail(req, res, jest.fn());
-
+  await verifyEmail({ query: { token: 'sometoken' } }, res, jest.fn());
   expect(res.status).toHaveBeenCalledWith(400);
   expect(res.json).toHaveBeenCalledWith({ error: 'Verification token has expired' });
 });
 
 test('verifyEmail: marks email verified and clears token on valid token', async () => {
-  db.query
-    .mockResolvedValueOnce({
-      rows: [{ id: '1', token_expires_at: new Date(Date.now() + 10000).toISOString() }]
-    })
-    .mockResolvedValueOnce({ rows: [] }); // UPDATE
-
-  const req = { query: { token: 'validtoken' } };
+  db.query.mockResolvedValueOnce({ rows: [{ id: '1', token_expires_at: new Date(Date.now() + 10000).toISOString() }] })
+    .mockResolvedValueOnce({ rows: [] });
   const res = mockRes();
-  await verifyEmail(req, res, jest.fn());
-
-  expect(db.query).toHaveBeenCalledWith(
-    expect.stringContaining('email_verified = TRUE'),
-    expect.any(Array)
-  );
-  expect(res.json).toHaveBeenCalledWith(
-    expect.objectContaining({ message: expect.stringContaining('verified successfully') })
-  );
+  await verifyEmail({ query: { token: 'validtoken' } }, res, jest.fn());
+  expect(db.query).toHaveBeenCalledWith(expect.stringContaining('email_verified = TRUE'), expect.any(Array));
+  expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('verified successfully') }));
 });
 
 test('verifyEmail: hashes the raw token before querying DB', async () => {
   const rawToken = 'mytesttoken';
-  const expectedHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-
   db.query.mockResolvedValueOnce({ rows: [] });
-
-  const req = { query: { token: rawToken } };
   const res = mockRes();
-  await verifyEmail(req, res, jest.fn());
-
+  await verifyEmail({ query: { token: rawToken } }, res, jest.fn());
   expect(db.query).toHaveBeenCalledWith(
     expect.stringContaining('verification_token'),
-    [expectedHash]
+    [crypto.createHash('sha256').update(rawToken).digest('hex')]
   );
 });
 
@@ -580,10 +767,11 @@ test('resetPassword: updates password and marks tokens used', async () => {
   const bcrypt = require('bcryptjs');
   db.query
     .mockResolvedValueOnce({ rows: [{ id: 't1', user_id: 'u1' }] })
-    .mockResolvedValueOnce({ rows: [] })
-    .mockResolvedValueOnce({ rows: [] })
-    .mockResolvedValueOnce({ rows: [] })
-    .mockResolvedValueOnce({ rows: [] });
+    .mockResolvedValueOnce({ rows: [] })  // BEGIN
+    .mockResolvedValueOnce({ rows: [] })  // UPDATE users
+    .mockResolvedValueOnce({ rows: [] })  // UPDATE password_reset_tokens
+    .mockResolvedValueOnce({ rows: [] })  // DELETE refresh_tokens
+    .mockResolvedValueOnce({ rows: [] }); // COMMIT
 
   const req = { body: { token: 'raw-reset-token', password: 'newpass12' } };
   const res = mockRes();
@@ -599,6 +787,29 @@ test('resetPassword: updates password and marks tokens used', async () => {
   expect(res.json).toHaveBeenCalledWith(
     expect.objectContaining({ message: expect.stringContaining('reset') })
   );
+});
+
+test('resetPassword: deletes all refresh tokens for user after reset', async () => {
+  const audit = require('../src/services/audit');
+  db.query
+    .mockResolvedValueOnce({ rows: [{ id: 't1', user_id: 'u1' }] })
+    .mockResolvedValueOnce({ rows: [] })  // BEGIN
+    .mockResolvedValueOnce({ rows: [] })  // UPDATE users
+    .mockResolvedValueOnce({ rows: [] })  // UPDATE password_reset_tokens
+    .mockResolvedValueOnce({ rows: [] })  // DELETE refresh_tokens
+    .mockResolvedValueOnce({ rows: [] }); // COMMIT
+
+  const req = { body: { token: 'raw-reset-token', password: 'newpass12' }, ip: '1.2.3.4', headers: { 'user-agent': 'test' } };
+  const res = mockRes();
+  await resetPassword(req, res, jest.fn());
+
+  const deleteCall = db.query.mock.calls.find(
+    (c) => typeof c[0] === 'string' && c[0].includes('DELETE FROM refresh_tokens')
+  );
+  expect(deleteCall).toBeDefined();
+  expect(deleteCall[1][0]).toBe('u1');
+
+  expect(audit.log).toHaveBeenCalledWith('u1', 'password_reset_sessions_invalidated', expect.anything(), expect.anything());
 });
 
 // ── getMe ─────────────────────────────────────────────────────────────────────

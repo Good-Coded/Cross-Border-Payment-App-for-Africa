@@ -28,8 +28,25 @@ const rpcUrl =
 
 const CONTRACT_ID = process.env.AGENT_ESCROW_CONTRACT_ID;
 
+const CONFIRMATION_TIMEOUT_MS = parseInt(process.env.SOROBAN_CONFIRMATION_TIMEOUT_MS || "30000", 10);
+const POLL_INTERVAL_MS = 1000;
+const MAX_POLL_ITERATIONS = Math.ceil(CONFIRMATION_TIMEOUT_MS / POLL_INTERVAL_MS);
+
 function getRpc() {
   return new StellarSdk.SorobanRpc.Server(rpcUrl);
+}
+
+async function getRecommendedFee(rpc) {
+  try {
+    const stats = await rpc.getFeeStats();
+    const p90 = stats?.sorobanInclusionFee?.p90;
+    if (p90 != null) {
+      return String(p90);
+    }
+    return String(StellarSdk.BASE_FEE * 10);
+  } catch {
+    return String(StellarSdk.BASE_FEE * 10);
+  }
 }
 
 function decryptSecret(encryptedKey) {
@@ -43,68 +60,8 @@ function decryptSecret(encryptedKey) {
   return decipher.update(encrypted, "hex", "utf8") + decipher.final("utf8");
 }
 
-async function invokeContract(encryptedSecretKey, method, args) {
-  if (!CONTRACT_ID) {
-    throw Object.assign(new Error("AGENT_ESCROW_CONTRACT_ID is not configured"), { status: 500 });
-  }
-
-  const secretKey = decryptSecret(encryptedSecretKey);
-  const keypair = StellarSdk.Keypair.fromSecret(secretKey);
-  const rpc = getRpc();
-
-  const account = await rpc.getAccount(keypair.publicKey());
-  const contract = new StellarSdk.Contract(CONTRACT_ID);
-
-  const tx = new StellarSdk.TransactionBuilder(account, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase,
-  })
-    .addOperation(contract.call(method, ...args))
-    .setTimeout(30)
-    .build();
-
-  const prepared = await rpc.prepareTransaction(tx);
-  prepared.sign(keypair);
-
-  const result = await rpc.sendTransaction(prepared);
-  if (result.status === "ERROR") {
-    throw Object.assign(new Error(`Contract call failed: ${result.errorResult}`), { status: 400 });
-  }
-
-  // Poll for confirmation
-  let response = result;
-  while (response.status === "PENDING" || response.status === "NOT_FOUND") {
-    await new Promise((r) => setTimeout(r, 1000));
-    response = await rpc.getTransaction(result.hash);
-  }
-
-  if (response.status !== "SUCCESS") {
-    throw Object.assign(new Error(`Transaction failed: ${response.status}`), { status: 400 });
-  }
-
-  return { hash: result.hash, returnValue: response.returnValue };
-}
-
-/**
- * Create an agent escrow on-chain.
- * Returns { escrowId, txHash }.
- */
-async function createEscrow({ encryptedSecretKey, recipient, agent, amount, feeBps }) {
-  const { hash, returnValue } = await invokeContract(
-    encryptedSecretKey,
-    "create_escrow",
-    [
-      // sender is derived from the keypair inside invokeContract — pass as arg
-      // The contract requires sender address; we pass it via the keypair public key
-      // resolved inside the helper below
-    ]
-  );
-  // Delegate to the full helper that has access to the keypair public key
-  return _createEscrow({ encryptedSecretKey, recipient, agent, amount, feeBps });
-}
-
 // Internal implementation with full arg list
-async function _createEscrow({ encryptedSecretKey, recipient, agent, amount, feeBps }) {
+async function createEscrow({ encryptedSecretKey, recipient, agent, amount, feeBps }) {
   const secretKey = decryptSecret(encryptedSecretKey);
   const keypair = StellarSdk.Keypair.fromSecret(secretKey);
   const sender = keypair.publicKey();
@@ -112,6 +69,7 @@ async function _createEscrow({ encryptedSecretKey, recipient, agent, amount, fee
 
   const account = await rpc.getAccount(sender);
   const contract = new StellarSdk.Contract(CONTRACT_ID);
+  const fee = await getRecommendedFee(rpc);
 
   const args = [
     StellarSdk.nativeToScVal(sender, { type: "address" }),
@@ -122,7 +80,7 @@ async function _createEscrow({ encryptedSecretKey, recipient, agent, amount, fee
   ];
 
   const tx = new StellarSdk.TransactionBuilder(account, {
-    fee: StellarSdk.BASE_FEE,
+    fee,
     networkPassphrase,
   })
     .addOperation(contract.call("create_escrow", ...args))
@@ -138,9 +96,14 @@ async function _createEscrow({ encryptedSecretKey, recipient, agent, amount, fee
   }
 
   let response = result;
+  let iterations = 0;
   while (response.status === "PENDING" || response.status === "NOT_FOUND") {
-    await new Promise((r) => setTimeout(r, 1000));
+    if (iterations >= MAX_POLL_ITERATIONS) {
+      throw Object.assign(new Error("Transaction confirmation timeout after 30s"), { status: 504 });
+    }
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     response = await rpc.getTransaction(result.hash);
+    iterations++;
   }
 
   if (response.status !== "SUCCESS") {
@@ -163,6 +126,7 @@ async function confirmPayout({ encryptedSecretKey, escrowId }) {
 
   const account = await rpc.getAccount(agent);
   const contract = new StellarSdk.Contract(CONTRACT_ID);
+  const fee = await getRecommendedFee(rpc);
 
   const args = [
     StellarSdk.nativeToScVal(agent, { type: "address" }),
@@ -170,10 +134,10 @@ async function confirmPayout({ encryptedSecretKey, escrowId }) {
   ];
 
   const tx = new StellarSdk.TransactionBuilder(account, {
-    fee: StellarSdk.BASE_FEE,
+    fee,
     networkPassphrase,
   })
-    .addOperation(contract.call("confirm_payout", ...args))
+    .addOperation(contract.call("confirm_delivery", ...args))
     .setTimeout(30)
     .build();
 
@@ -182,13 +146,18 @@ async function confirmPayout({ encryptedSecretKey, escrowId }) {
 
   const result = await rpc.sendTransaction(prepared);
   if (result.status === "ERROR") {
-    throw Object.assign(new Error(`confirm_payout failed: ${result.errorResult}`), { status: 400 });
+    throw Object.assign(new Error(`confirm_delivery failed: ${result.errorResult}`), { status: 400 });
   }
 
   let response = result;
+  let iterations = 0;
   while (response.status === "PENDING" || response.status === "NOT_FOUND") {
-    await new Promise((r) => setTimeout(r, 1000));
+    if (iterations >= MAX_POLL_ITERATIONS) {
+      throw Object.assign(new Error("Transaction confirmation timeout after 30s"), { status: 504 });
+    }
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     response = await rpc.getTransaction(result.hash);
+    iterations++;
   }
 
   if (response.status !== "SUCCESS") {
@@ -210,6 +179,7 @@ async function cancelEscrow({ encryptedSecretKey, escrowId }) {
 
   const account = await rpc.getAccount(sender);
   const contract = new StellarSdk.Contract(CONTRACT_ID);
+  const fee = await getRecommendedFee(rpc);
 
   const args = [
     StellarSdk.nativeToScVal(sender, { type: "address" }),
@@ -217,7 +187,7 @@ async function cancelEscrow({ encryptedSecretKey, escrowId }) {
   ];
 
   const tx = new StellarSdk.TransactionBuilder(account, {
-    fee: StellarSdk.BASE_FEE,
+    fee,
     networkPassphrase,
   })
     .addOperation(contract.call("cancel_escrow", ...args))
@@ -233,9 +203,14 @@ async function cancelEscrow({ encryptedSecretKey, escrowId }) {
   }
 
   let response = result;
+  let iterations = 0;
   while (response.status === "PENDING" || response.status === "NOT_FOUND") {
-    await new Promise((r) => setTimeout(r, 1000));
+    if (iterations >= MAX_POLL_ITERATIONS) {
+      throw Object.assign(new Error("Transaction confirmation timeout after 30s"), { status: 504 });
+    }
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     response = await rpc.getTransaction(result.hash);
+    iterations++;
   }
 
   if (response.status !== "SUCCESS") {
@@ -245,4 +220,4 @@ async function cancelEscrow({ encryptedSecretKey, escrowId }) {
   return { txHash: result.hash };
 }
 
-module.exports = { createEscrow: _createEscrow, confirmPayout, cancelEscrow };
+module.exports = { createEscrow, confirmPayout, cancelEscrow };
