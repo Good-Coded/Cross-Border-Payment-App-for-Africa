@@ -88,6 +88,15 @@ pub struct EvtCancelled {
     pub refund_amount: i128,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct AdminOverride {
+    pub escrow_id: u64,
+    pub admin: Address,
+    pub to_agent: bool,
+    pub amount: i128,
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -351,5 +360,101 @@ impl AgentEscrowContract {
         );
 
         env.storage().persistent().set(&DataKey::Fees, &(fees - amount));
+    }
+
+    /// Update the admin address. Only the current admin may call this.
+    ///
+    /// # Arguments
+    /// * `new_admin` — Address that will become the new admin.
+    pub fn update_admin(env: Env, new_admin: Address) {
+        let stored_admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).unwrap();
+        if new_admin == stored_admin {
+            panic!("new admin must differ from current admin");
+        }
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+    }
+
+    /// Admin override to release or refund a pending escrow before timeout.
+    ///
+    /// If `to_agent` is true, transfers the full amount (minus platform fee) to the agent.
+    /// If `to_agent` is false, refunds the full amount to the sender.
+    ///
+    /// # Arguments
+    /// * `escrow_id` — ID of the escrow to override.
+    /// * `to_agent`  — true to release to agent, false to refund sender.
+    pub fn admin_release(env: Env, escrow_id: u64, to_agent: bool) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap();
+        admin.require_auth();
+
+        let mut escrow: AgentEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("escrow not found");
+
+        if escrow.status != EscrowStatus::Pending {
+            panic!("escrow is not pending");
+        }
+
+        let fee_amount = (escrow.amount * escrow.fee_bps as i128) / 10_000;
+        let net_amount = escrow.amount - fee_amount;
+
+        let usdc: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsdcAddress)
+            .unwrap();
+
+        if to_agent {
+            token::Client::new(&env, &usdc).transfer(
+                &env.current_contract_address(),
+                &escrow.agent,
+                &net_amount,
+            );
+            escrow.status = EscrowStatus::Completed;
+
+            let fees: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Fees)
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Fees, &(fees + fee_amount));
+
+            env.events().publish(
+                (Symbol::new(&env, "PayoutConfirmed"),),
+                EvtCompleted { escrow_id, agent_amount: net_amount, fee_amount },
+            );
+        } else {
+            token::Client::new(&env, &usdc).transfer(
+                &env.current_contract_address(),
+                &escrow.sender,
+                &escrow.amount,
+            );
+            escrow.status = EscrowStatus::Cancelled;
+
+            env.events().publish(
+                (Symbol::new(&env, "EscrowCancelled"),),
+                EvtCancelled { escrow_id, refund_amount: escrow.amount },
+            );
+        }
+
+        env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "AdminOverride"),),
+            AdminOverride {
+                escrow_id,
+                admin,
+                to_agent,
+                amount: escrow.amount,
+            },
+        );
     }
 }
