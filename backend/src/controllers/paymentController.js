@@ -37,6 +37,31 @@ function calculateFee(amount) {
   return parseFloat((parseFloat(amount) * FEE_BPS / 10000).toFixed(7));
 }
 
+/**
+ * Build the structured fee breakdown for a payment.
+ * @param {string|number} grossAmount  - Amount the sender sent
+ * @param {string}        asset        - e.g. "USDC" or "XLM"
+ * @param {string|null}   feeCharged   - Stellar fee_charged in stroops (from Horizon result)
+ */
+function buildFeeBreakdown(grossAmount, asset, feeCharged) {
+  const gross = parseFloat(grossAmount);
+  const PLATFORM_FEE_BPS = parseInt(process.env.PLATFORM_FEE_BPS || "250", 10);
+  const platformFee = parseFloat((gross * PLATFORM_FEE_BPS / 10000).toFixed(7));
+  const stellarBaseFeeXlm = feeCharged != null
+    ? parseFloat((parseInt(feeCharged, 10) / 1e7).toFixed(7))
+    : null;
+  const netAmount = parseFloat((gross - platformFee).toFixed(7));
+
+  return {
+    gross_amount_usdc: parseFloat(gross.toFixed(7)),
+    platform_fee_bps: PLATFORM_FEE_BPS,
+    platform_fee_usdc: platformFee,
+    stellar_base_fee_xlm: stellarBaseFeeXlm,
+    net_amount_usdc: parseFloat(netAmount.toFixed(7)),
+    asset,
+  };
+}
+
 // Approximate XLM/USD rate  in production replace with a live price feed
 const XLM_USD_RATE = parseFloat(process.env.XLM_USD_RATE || "0.11");
 
@@ -162,6 +187,29 @@ async function estimateFee(req, res, next) {
   try {
     const fee = await fetchFee();
     res.json({ fee_stroops: fee, fee_xlm: (fee / 1e7).toFixed(7) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/payments/estimate-fees?amount=100&asset=USDC
+ * Returns a pre-submission fee breakdown without processing a payment.
+ */
+async function estimateFees(req, res, next) {
+  try {
+    const { amount, asset = "USDC" } = req.query;
+    if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+      return res.status(400).json({ error: "amount must be a positive number" });
+    }
+    const VALID = ["XLM", "USDC", "NGN", "GHS", "KES"];
+    if (!VALID.includes(asset)) {
+      return res.status(400).json({ error: `asset must be one of: ${VALID.join(", ")}` });
+    }
+    let stellarFeeStroops = null;
+    try { stellarFeeStroops = await fetchFee(); } catch (_) { /* non-fatal */ }
+    const breakdown = buildFeeBreakdown(amount, asset, stellarFeeStroops);
+    res.json({ fee_breakdown: breakdown });
   } catch (err) {
     next(err);
   }
@@ -314,7 +362,7 @@ async function send(req, res, next) {
     await checkSufficientBalance(public_key, amount, asset);
 
     // Broadcast to Stellar
-    const { transactionHash, ledger, type, claimableBalanceId } = await sendPayment({
+    const { transactionHash, ledger, type, claimableBalanceId, feeCharged } = await sendPayment({
       senderPublicKey: public_key,
       encryptedSecretKey: encrypted_secret_key,
       recipientPublicKey: recipient_address,
@@ -327,12 +375,15 @@ async function send(req, res, next) {
 
     const ledger_close_time = await fetchLedgerCloseTime(ledger);
 
+    // Build fee breakdown
+    const fee_breakdown = buildFeeBreakdown(amount, asset, feeCharged ?? null);
+
     // Save to DB
     const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
     await db.query(
-      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-      [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time],
+      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+      [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(fee_breakdown)],
     );
 
     if (type !== "claimable_balance") {
@@ -391,6 +442,7 @@ async function send(req, res, next) {
         recipient: recipient_address,
         type,
         claimableBalanceId,
+        fee_breakdown,
       },
     });
   } catch (err) {
@@ -626,7 +678,7 @@ async function history(req, res, next) {
     }
     const whereClause = conditions.join(" AND ");
 
-    const listSql = `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, created_at, ledger_close_time
+    const listSql = `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, created_at, ledger_close_time, fee_breakdown
          FROM transactions
          WHERE ${whereClause}
          ORDER BY id DESC LIMIT $${baseParams.length + 1}`;
@@ -986,4 +1038,36 @@ async function exportCSV(req, res, next) {
   }
 }
 
-module.exports = { send, sendBatch, history, findPath, sendPath, exportCSV, estimateFee, getFeeStats, getFeeRate, findReceivePathHandler, sendStrictReceivePath };
+/**
+ * GET /api/payments/:id
+ * Returns a single payment record for the authenticated user, including fee_breakdown.
+ */
+async function getPaymentById(req, res, next) {
+  try {
+    const walletResult = await db.query(
+      "SELECT public_key FROM wallets WHERE user_id = $1",
+      [req.user.userId],
+    );
+    const publicKeys = walletResult.rows.map((r) => r.public_key);
+    if (publicKeys.length === 0) return res.status(404).json({ error: "Wallet not found" });
+
+    const result = await db.query(
+      `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type,
+              tx_hash, status, created_at, ledger_close_time, fee_breakdown
+       FROM transactions
+       WHERE id = $1 AND (sender_wallet = ANY($2) OR recipient_wallet = ANY($2))`,
+      [req.params.id, publicKeys],
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Payment not found" });
+
+    const tx = result.rows[0];
+    res.json({
+      ...tx,
+      direction: publicKeys.includes(tx.sender_wallet) ? "sent" : "received",
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { send, sendBatch, history, findPath, sendPath, exportCSV, estimateFee, estimateFees, getFeeStats, getFeeRate, findReceivePathHandler, sendStrictReceivePath, getPaymentById };
