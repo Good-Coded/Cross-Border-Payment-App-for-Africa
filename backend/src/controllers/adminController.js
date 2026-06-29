@@ -243,7 +243,11 @@ async function approveKYC(req, res, next) {
       [userId]
     );
 
-    await audit.log(req.user.userId, "kyc_approved", { target_user: userId, tx_hash: txHash });
+    await audit.auditLog(req, 'kyc_approved', {
+      type: 'user',
+      id: userId,
+      newValue: { kyc_status: 'verified', tx_hash: txHash },
+    });
 
     res.json({ message: "KYC approved", tx_hash: txHash });
   } catch (err) {
@@ -290,7 +294,12 @@ async function revokeKYC(req, res, next) {
       [userId]
     );
 
-    await audit.log(req.user.userId, "kyc_revoked", { target_user: userId, tx_hash: txHash });
+    await audit.auditLog(req, 'kyc_revoked', {
+      type: 'user',
+      id: userId,
+      oldValue: { kyc_status: 'verified' },
+      newValue: { kyc_status: 'unverified', tx_hash: txHash },
+    });
 
     res.json({ message: "KYC revoked", tx_hash: txHash });
   } catch (err) {
@@ -779,8 +788,10 @@ async function bulkSuspend(req, res, next) {
     );
     await client.query('COMMIT');
 
-    await audit.log(req.user.userId, 'bulk_suspend', req.ip, req.headers['user-agent'],
-      { user_count: userIds.length, reason: reason || null });
+    await audit.auditLog(req, 'user_suspension', {
+      type: 'bulk_user',
+      newValue: { user_ids: userIds, reason: reason || null },
+    });
 
     // Queue suspension emails (fire-and-forget)
     db.query('SELECT email, full_name FROM users WHERE id = ANY($1::uuid[])', [userIds])
@@ -812,8 +823,10 @@ async function bulkUnsuspend(req, res, next) {
       [userIds]
     );
     await client.query('COMMIT');
-    await audit.log(req.user.userId, 'bulk_unsuspend', req.ip, req.headers['user-agent'],
-      { user_count: userIds.length });
+    await audit.auditLog(req, 'user_unsuspend', {
+      type: 'bulk_user',
+      newValue: { user_ids: userIds },
+    });
     res.json({ message: 'Users unsuspended', count: userIds.length });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -904,11 +917,72 @@ async function bulkKycUpdate(req, res, next) {
   }
 }
 
+/**
+ * GET /api/admin/audit-logs
+ * Cursor-based paginated audit log viewer.
+ * Supports filtering by actor, action, resource_type, and date range.
+ */
+async function getAuditLogs(req, res, next) {
+  try {
+    const { actor, action, resource_type, from, to, cursor } = req.query;
+    const limit = Math.min(100, parseInt(req.query.limit, 10) || 20);
+
+    const conditions = [];
+    const params = [];
+
+    if (actor) {
+      params.push(actor);
+      conditions.push(`user_id = $${params.length}`);
+    }
+    if (action) {
+      params.push(action);
+      conditions.push(`action = $${params.length}`);
+    }
+    if (resource_type) {
+      params.push(resource_type);
+      conditions.push(`resource_type = $${params.length}`);
+    }
+    if (from) {
+      params.push(from);
+      conditions.push(`created_at >= $${params.length}`);
+    }
+    if (to) {
+      params.push(to);
+      conditions.push(`created_at <= $${params.length}`);
+    }
+    if (cursor) {
+      params.push(cursor);
+      conditions.push(`created_at < $${params.length}`);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    params.push(limit + 1);
+
+    const { rows } = await db.query(
+      `SELECT id, user_id AS actor_id, actor_role, action, resource_type, resource_id,
+              old_value, new_value, ip_address, user_agent, created_at
+       FROM audit_logs ${where}
+       ORDER BY created_at DESC
+       LIMIT $${params.length}`,
+      params
+    );
+
+    const hasMore = rows.length > limit;
+    const data = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor = hasMore ? data[data.length - 1].created_at.toISOString() : null;
+
+    res.json({ data, next_cursor: nextCursor, has_more: hasMore });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   getStats,
   getUsers,
   getTransactions,
   getDailyTransactionStats,
+  getStellarNetworkStats,
   clawback,
   approveKYC,
   revokeKYC,
@@ -929,4 +1003,6 @@ module.exports = {
   bulkExport,
   getJobStatus,
   bulkKycUpdate,
+  // #698
+  getAuditLogs,
 };

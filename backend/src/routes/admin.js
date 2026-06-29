@@ -29,6 +29,7 @@ const {
   bulkExport,
   getJobStatus,
   bulkKycUpdate,
+  getAuditLogs,
 } = require('../controllers/adminController');
 const { getDeadLetterNotifications } = require('../controllers/notificationController');
 
@@ -253,5 +254,10 @@ router.get('/jobs/:jobId', getJobStatus);
 // Dead-letter notifications (#693)
 // ---------------------------------------------------------------------------
 router.get('/notifications/dead-letter', getDeadLetterNotifications);
+
+// ---------------------------------------------------------------------------
+// Immutable Audit Log (#698)
+// ---------------------------------------------------------------------------
+router.get('/audit-logs', getAuditLogs);
 
 module.exports = router;
