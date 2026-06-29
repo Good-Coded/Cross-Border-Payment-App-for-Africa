@@ -35,10 +35,49 @@ const wsConnections = new client.Gauge({
   registers: [registry],
 });
 
+const paymentsTotal = new client.Counter({
+  name: 'afripay_payments_total',
+  help: 'Total payment state changes',
+  labelNames: ['status', 'asset'],
+  registers: [registry],
+});
+
+const paymentAmountUsdc = new client.Histogram({
+  name: 'afripay_payment_amount_usdc',
+  help: 'Distribution of payment amounts in USDC',
+  buckets: [1, 5, 10, 50, 100, 500, 1000, 5000, 10000],
+  registers: [registry],
+});
+
+const afripayHorizonDuration = new client.Histogram({
+  name: 'afripay_horizon_request_duration_ms',
+  help: 'Horizon API call latency in milliseconds',
+  labelNames: ['endpoint'],
+  buckets: [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+  registers: [registry],
+});
+
+const activeUsers = new client.Gauge({
+  name: 'afripay_active_users',
+  help: 'Users with sessions active in last 5 minutes',
+  registers: [registry],
+});
+
+const emailQueueDepth = new client.Gauge({
+  name: 'afripay_email_queue_depth',
+  help: 'Email queue waiting job count',
+  registers: [registry],
+});
+
 module.exports = {
   registry,
   httpRequestDuration,
   horizonRequestDuration,
   dbQueryDuration,
   wsConnections,
+  paymentsTotal,
+  paymentAmountUsdc,
+  afripayHorizonDuration,
+  activeUsers,
+  emailQueueDepth,
 };

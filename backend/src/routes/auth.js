@@ -6,9 +6,6 @@ const {
   refresh,
   logout,
   verifyEmail,
-  getMe,
-  setPIN,
-  verifyPIN,
   verifyPhone,
   getMe,
   updateProfile,
@@ -20,6 +17,8 @@ const {
   disable2FA,
   forgotPassword,
   resetPassword,
+  regenerateBackupCodes,
+  getBackupCodeCount,
 } = require('../controllers/authController');
 const authMiddleware = require('../middleware/auth');
 const geoRestriction = require('../middleware/geoRestriction');
@@ -153,6 +152,16 @@ router.post('/2fa/disable',
   validate,
   disable2FA
 );
+
+router.post(
+  '/2fa/backup-codes/regenerate',
+  authMiddleware,
+  [body('totp_code').matches(/^\d{6}$/).withMessage('TOTP code must be 6 digits')],
+  validate,
+  regenerateBackupCodes
+);
+
+router.get('/2fa/backup-codes/count', authMiddleware, getBackupCodeCount);
 
 const { listSessions, revokeSession, revokeAllSessions } = require('../controllers/sessionController');
 

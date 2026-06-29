@@ -6,10 +6,8 @@ const { createWallet, encryptPrivateKey, addTrustline } = require('../services/s
 const audit = require('../services/audit');
 const logger = require('../utils/logger');
 const { hashPIN, comparePIN, validatePIN } = require('../services/pin');
-const { sendVerificationEmail } = require('../services/email');
-const logger = require('../utils/logger');
-const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email');
-const { generateSecret, verifyToken, generateBackupCodes, useBackupCode } = require('../services/twofa');
+const { sendVerificationEmail, sendPasswordResetEmail, sendBackupCodeWarningEmail } = require('../services/email');
+const { generateSecret, verifyToken, generateBackupCodes, useBackupCode, hashBackupCode, verifyBackupCode } = require('../services/twofa');
 const {
   COOKIE_NAME,
   COOKIE_OPTIONS,
@@ -22,7 +20,6 @@ const TOKEN_TTL_MS = 96 * 60 * 60 * 1000; // 96 hours
 const { sendOTP } = require('../services/sms');
 const { recordSession } = require('./sessionController');
 
-const TOKEN_TTL_MS = 96 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 const PHONE_OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -258,28 +255,41 @@ async function login(req, res, next) {
       return res.status(403).json({ error: 'Please verify your email before logging in.' });
     }
 
-    // Short-lived access token
-    const token = signAccessToken({ userId: user.id, email: user.email, role: user.role });
-
-    // Refresh token — store only the hash, seed a new family
-    const { raw, hash } = generateRefreshToken();
-    const familyId = uuidv4();
-    await db.query(
-      `INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, revoked, expires_at)
-       VALUES ($1, $2, $3, $4, FALSE, $5)`,
-      [uuidv4(), user.id, hash, familyId, refreshTokenExpiresAt()]
-    );
-
-    res.cookie(COOKIE_NAME, raw, COOKIE_OPTIONS);
     // Check if 2FA is enabled
     if (user.totp_enabled) {
-      if (!totp_code) {
+      const { totp_code: totpCode, backup_code } = req.body;
+      if (!totpCode && !backup_code) {
         return res.status(403).json({ error: 'TOTP code required', requires_2fa: true });
       }
 
-      const isValid = verifyToken(user.totp_secret, totp_code);
-      if (!isValid) {
-        return res.status(401).json({ error: 'Invalid TOTP code' });
+      if (backup_code) {
+        const codes = await db.query(
+          `SELECT id, code_hash FROM totp_backup_codes WHERE user_id = $1 AND used_at IS NULL`,
+          [user.id]
+        );
+        let matchedId = null;
+        for (const row of codes.rows) {
+          if (await verifyBackupCode(backup_code, row.code_hash)) {
+            matchedId = row.id;
+            break;
+          }
+        }
+        if (!matchedId) {
+          return res.status(401).json({ error: 'BACKUP_CODE_USED' });
+        }
+        await db.query(`UPDATE totp_backup_codes SET used_at = NOW() WHERE id = $1`, [matchedId]);
+        const remaining = await db.query(
+          `SELECT COUNT(*) AS count FROM totp_backup_codes WHERE user_id = $1 AND used_at IS NULL`,
+          [user.id]
+        );
+        if (parseInt(remaining.rows[0].count, 10) < 3) {
+          const emailRow = await db.query('SELECT email FROM users WHERE id = $1', [user.id]);
+          sendBackupCodeWarningEmail(emailRow.rows[0].email, parseInt(remaining.rows[0].count, 10)).catch(() => {});
+        }
+      } else {
+        if (!verifyToken(user.totp_secret, totpCode)) {
+          return res.status(401).json({ error: 'Invalid TOTP code' });
+        }
       }
     }
 
@@ -532,13 +542,63 @@ async function verify2FA(req, res, next) {
       return res.status(401).json({ error: 'Invalid TOTP code' });
     }
 
-    await db.query(
-      `UPDATE users SET totp_enabled = TRUE WHERE id = $1`,
-      [userId]
-    );
+    await db.query(`UPDATE users SET totp_enabled = TRUE WHERE id = $1`, [userId]);
+
+    const rawCodes = generateBackupCodes(10);
+    await db.query(`DELETE FROM totp_backup_codes WHERE user_id = $1`, [userId]);
+    for (const code of rawCodes) {
+      const hash = await hashBackupCode(code);
+      await db.query(
+        `INSERT INTO totp_backup_codes (user_id, code_hash) VALUES ($1, $2)`,
+        [userId, hash]
+      );
+    }
 
     audit.log(userId, '2fa_enabled', req.ip, req.headers['user-agent']);
-    res.json({ message: '2FA enabled successfully' });
+    res.json({ message: '2FA enabled successfully', backup_codes: rawCodes });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function regenerateBackupCodes(req, res, next) {
+  try {
+    const { totp_code } = req.body;
+    const userId = req.user.userId;
+
+    const user = await db.query('SELECT totp_secret, totp_enabled FROM users WHERE id = $1', [userId]);
+    if (!user.rows[0]?.totp_enabled) {
+      return res.status(400).json({ error: '2FA is not enabled' });
+    }
+    if (!verifyToken(user.rows[0].totp_secret, totp_code)) {
+      return res.status(401).json({ error: 'Invalid TOTP code' });
+    }
+
+    const rawCodes = generateBackupCodes(10);
+    await db.query(`DELETE FROM totp_backup_codes WHERE user_id = $1`, [userId]);
+    for (const code of rawCodes) {
+      const hash = await hashBackupCode(code);
+      await db.query(
+        `INSERT INTO totp_backup_codes (user_id, code_hash) VALUES ($1, $2)`,
+        [userId, hash]
+      );
+    }
+
+    audit.log(userId, '2fa_backup_codes_regenerated', req.ip, req.headers['user-agent']);
+    res.json({ backup_codes: rawCodes });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getBackupCodeCount(req, res, next) {
+  try {
+    const userId = req.user.userId;
+    const result = await db.query(
+      `SELECT COUNT(*) AS count FROM totp_backup_codes WHERE user_id = $1 AND used_at IS NULL`,
+      [userId]
+    );
+    res.json({ remaining: parseInt(result.rows[0].count, 10) });
   } catch (err) {
     next(err);
   }
@@ -598,12 +658,6 @@ async function verifyPIN(req, res, next) {
 
     const result = await db.query(`SELECT pin_hash FROM users WHERE id = $1`, [userId]);
     if (!result.rows[0]) return res.status(404).json({ error: 'User not found' });
-
-    const { pin_hash } = result.rows[0];
-
-    if (!result.rows[0]) {
-      return res.status(404).json({ error: 'User not found' });
-    }
 
     const { pin_hash } = result.rows[0];
 
@@ -878,4 +932,6 @@ module.exports = {
   disable2FA,
   forgotPassword,
   resetPassword,
+  regenerateBackupCodes,
+  getBackupCodeCount,
 };
