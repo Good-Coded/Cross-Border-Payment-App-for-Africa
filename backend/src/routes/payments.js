@@ -22,6 +22,7 @@ const {
   findReceivePathHandler,
   sendStrictReceivePath,
   getPaymentById,
+  cancelPendingEscrow,
 } = require("../controllers/paymentController");
 const { buildTransaction, submitSigned } = require("../controllers/ledgerController");
 const { resolveFederationAddress } = require("../services/stellar");
@@ -317,6 +318,20 @@ router.post(
 // User-specific analytics (accessible to all authenticated users)
 const { summary: userAnalyticsSummary } = require("../controllers/analyticsController");
 router.get("/analytics", userAnalyticsSummary);
+
+/**
+ * POST /api/payments/:id/cancel
+ * Cancel a pending escrow payment and refund the sender on-chain.
+ * The 48-hour lock must have elapsed before cancellation is allowed.
+ */
+router.post(
+  "/:id/cancel",
+  [
+    require("express-validator").param("id").isUUID().withMessage("id must be a valid UUID"),
+    validate,
+  ],
+  cancelPendingEscrow,
+);
 
 /**
  * GET /api/payments/:id
