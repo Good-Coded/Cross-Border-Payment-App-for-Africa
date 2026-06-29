@@ -4,6 +4,7 @@ const logger = require('../utils/logger');
 const { withRetry, retryWithBackoff } = require('../utils/retry');
 const { withTimeout } = require('../utils/withTimeout');
 const { enqueue } = require('../utils/txQueue');
+const { checkMemoRequired } = require('./memoRequired');
 const {
   AccountResponseSchema,
   TransactionSubmitResponseSchema,
@@ -159,18 +160,31 @@ async function getBalance(publicKey) {
 
     return {
       account_exists: true,
+      num_subentries: numSubentries,
       balances: account.balances.map(b => {
         if (b.asset_type === 'native') {
           const total = parseFloat(b.balance);
           const available = Math.max(0, total - minBalance);
           return {
+            asset_type: 'native',
+            asset_code: 'XLM',
+            asset_issuer: null,
             asset: 'XLM',
             balance: b.balance,
             available_balance: available.toFixed(7),
             min_balance: minBalance.toFixed(7),
+            minimum_balance_reserve: minBalance.toFixed(7),
           };
         }
-        return { asset: b.asset_code, balance: b.balance };
+        return {
+          asset_type: b.asset_type,
+          asset_code: b.asset_code,
+          asset_issuer: b.asset_issuer || null,
+          asset: b.asset_code,
+          balance: b.balance,
+          limit: b.limit || null,
+          is_authorized: b.is_authorized ?? true,
+        };
       }),
     };
   } catch (e) {
@@ -440,6 +454,15 @@ async function _sendPaymentOnce({
 }, logger) {
   // Guard against testnet/mainnet mixup
   validateNetworkPassphrase(networkPassphrase);
+
+  // Enforce memo requirement for known exchange destinations
+  const memoRequired = await checkMemoRequired(recipientPublicKey);
+  if (memoRequired && !memo) {
+    const err = new Error('The destination account requires a transaction memo. Please add a memo and retry.');
+    err.status = 400;
+    err.code = 'MEMO_REQUIRED';
+    throw err;
+  }
 
   const assetObj = resolveAsset(asset);
 

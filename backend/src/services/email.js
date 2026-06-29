@@ -1,4 +1,6 @@
 const nodemailer = require('nodemailer');
+const { Queue, Worker } = require('bullmq');
+const logger = require('../utils/logger');
 
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
@@ -6,18 +8,109 @@ const transporter = nodemailer.createTransport({
   secure: process.env.SMTP_SECURE === 'true',
   auth: {
     user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
+    pass: process.env.SMTP_PASS,
+  },
 });
+
+// ---------------------------------------------------------------------------
+// Bull email queue (Issue #706)
+// ---------------------------------------------------------------------------
+
+let emailQueue = null;
+let emailWorker = null;
+
+const RETRY_DELAYS = [60_000, 300_000, 1_800_000]; // 1 min, 5 min, 30 min
+
+function getRedisConnection() {
+  if (!process.env.REDIS_URL) return null;
+  const { Redis } = require('ioredis');
+  return new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
+}
+
+function initEmailQueue() {
+  const connection = getRedisConnection();
+  if (!connection) {
+    logger.warn('REDIS_URL not set — email queue disabled, falling back to synchronous send');
+    return;
+  }
+
+  emailQueue = new Queue('email-queue', {
+    connection,
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { type: 'custom' },
+      removeOnComplete: 1000,
+      removeOnFail: 5000,
+    },
+  });
+
+  emailWorker = new Worker(
+    'email-queue',
+    async (job) => {
+      const { to, subject, html } = job.data;
+      await transporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to,
+        subject,
+        html,
+      });
+      logger.info('Email sent', { jobId: job.id, to });
+    },
+    {
+      connection: getRedisConnection(),
+      // custom backoff uses RETRY_DELAYS array
+      settings: {
+        backoffStrategy: (attemptsMade) => RETRY_DELAYS[attemptsMade - 1] ?? 1_800_000,
+      },
+    }
+  );
+
+  emailWorker.on('failed', (job, err) => {
+    if (job.attemptsMade >= job.opts.attempts) {
+      logger.error('CRITICAL: email job exhausted retries', {
+        jobId: job.id,
+        to: job.data.to,
+        error: err.message,
+      });
+    }
+  });
+
+  logger.info('Email queue initialized');
+}
+
+/**
+ * Enqueue an email job (fire-and-forget from the request perspective).
+ * Falls back to synchronous send if Redis is unavailable.
+ */
+async function enqueueEmail(jobData) {
+  if (emailQueue) {
+    return emailQueue.add('send', jobData);
+  }
+  // Fallback: send synchronously
+  return transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: jobData.to,
+    subject: jobData.subject,
+    html: jobData.html,
+  });
+}
+
+async function drainEmailQueue() {
+  if (emailWorker) await emailWorker.close();
+  if (emailQueue) await emailQueue.close();
+}
+
+// ---------------------------------------------------------------------------
+// Transactional email helpers
+// ---------------------------------------------------------------------------
 
 async function sendVerificationEmail(email, token) {
   const url = `${process.env.FRONTEND_URL}/verify-email?token=${token}`;
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+  return enqueueEmail({
     to: email,
     subject: 'Verify your AfriPay email',
     html: `<p>Click the link below to verify your email. It expires in 96 hours.</p>
-           <a href="${url}">${url}</a>`
+           <a href="${url}">${url}</a>`,
   });
 }
 
@@ -46,14 +139,33 @@ async function sendExpiryNotification(email, name, recipientWallet, amount, asse
 
 async function sendPasswordResetEmail(email, token) {
   const url = `${process.env.FRONTEND_URL}/reset-password?token=${encodeURIComponent(token)}`;
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+  return enqueueEmail({
     to: email,
     subject: 'Reset your AfriPay password',
     html: `<p>You requested a password reset. This link expires in 1 hour and can only be used once.</p>
            <a href="${url}">${url}</a>
-           <p>If you did not request this, you can ignore this email.</p>`
+           <p>If you did not request this, you can ignore this email.</p>`,
   });
+}
+
+async function sendExpiryNotification(email, name, recipientWallet, amount, asset, daysLeft, type) {
+  const subject =
+    type === 'sender'
+      ? `Your claimable balance expires in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`
+      : `You have unclaimed funds expiring in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`;
+
+  const html =
+    type === 'sender'
+      ? `<p>Hi ${name},</p>
+         <p>Your claimable balance of <strong>${amount} ${asset}</strong> sent to <code>${recipientWallet}</code> will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong>.</p>
+         <p>If the recipient doesn't claim the funds before expiry, they will be automatically returned to your account.</p>
+         <p><a href="${process.env.FRONTEND_URL}/history">View in AfriPay</a></p>`
+      : `<p>Hi ${name},</p>
+         <p>You have unclaimed funds of <strong>${amount} ${asset}</strong> waiting for you!</p>
+         <p>These funds will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong> if not claimed.</p>
+         <p><a href="${process.env.FRONTEND_URL}/dashboard">Claim your funds now</a></p>`;
+
+  return enqueueEmail({ to: email, subject, html });
 }
 
 async function sendTransactionEmail(email, type, tx) {
@@ -150,6 +262,22 @@ module.exports = {
   sendTransactionEmail,
   sendPaymentRequestExpiredEmail,
   sendBackupCodeWarningEmail,
+  return enqueueEmail({ to: email, subject, html });
+}
+
+function getEmailQueue() {
+  return emailQueue;
+}
+
+module.exports = {
+  initEmailQueue,
+  drainEmailQueue,
+  enqueueEmail,
+  getEmailQueue,
+  sendVerificationEmail,
+  sendPasswordResetEmail,
+  sendExpiryNotification,
+  sendTransactionEmail,
 };
 async function sendKycExpiryReminderEmail(email, name, daysRemaining) {
   const subject = `Action required: Your AfriPay identity document expires in ${daysRemaining} day${daysRemaining !== 1 ? 's' : ''}`;
