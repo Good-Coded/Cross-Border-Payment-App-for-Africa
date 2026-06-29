@@ -6,7 +6,7 @@ use soroban_sdk::{
     Address, Env,
 };
 
-use crate::{AgentEscrowContract, AgentEscrowContractClient, EscrowStatus};
+use crate::{AgentEscrowContract, AgentEscrowContractClient, AdminOverride, EscrowStatus};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -366,4 +366,97 @@ fn test_withdraw_fees_exceeds_balance_panics() {
 fn test_get_fees_initial_is_zero() {
     let (_, client, _, _) = setup();
     assert_eq!(client.get_fees(), 0);
+}
+
+// ── update_admin ───────────────────────────────────────────────────────────────
+
+#[test]
+fn test_update_admin_changes_stored_admin() {
+    let (env, client, admin, usdc_id) = setup();
+    let new_admin = Address::generate(&env);
+    client.update_admin(&new_admin);
+    // Verify by attempting admin-only action with new admin
+    let amount = 500_0000000i128;
+    let (sender, _, agent, id) = make_escrow(&env, &client, &usdc_id, &new_admin, amount, 100);
+    client.confirm_payout(&agent, &id);
+    assert_eq!(client.get_escrow(&id).status, EscrowStatus::Completed);
+}
+
+#[test]
+#[should_panic(expected = "new admin must differ from current admin")]
+fn test_update_admin_same_address_panics() {
+    let (_, client, admin, _) = setup();
+    client.update_admin(&admin);
+}
+
+// ── admin_release ──────────────────────────────────────────────────────────────
+
+#[test]
+fn test_admin_release_to_agent_on_pending_escrow() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
+
+    client.admin_release(&id, &true);
+
+    let escrow = client.get_escrow(&id);
+    assert_eq!(escrow.status, EscrowStatus::Completed);
+    let expected_fee = (amount * 250i128) / 10_000;
+    let expected_agent = amount - expected_fee;
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), expected_agent);
+    assert_eq!(client.get_fees(), expected_fee);
+}
+
+#[test]
+fn test_admin_release_refunds_sender_on_pending_escrow() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let (sender, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
+
+    client.admin_release(&id, &false);
+
+    let escrow = client.get_escrow(&id);
+    assert_eq!(escrow.status, EscrowStatus::Cancelled);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount);
+}
+
+#[test]
+#[should_panic(expected = "escrow is not pending")]
+fn test_admin_release_on_completed_escrow_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 250);
+    client.confirm_payout(&agent, &id);
+    client.admin_release(&admin, &id, &true);
+}
+
+#[test]
+#[should_panic(expected = "escrow is not pending")]
+fn test_admin_release_on_cancelled_escrow_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let (sender, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 250);
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
+    client.cancel_escrow(&sender, &id);
+    client.admin_release(&admin, &id, &false);
+}
+
+#[test]
+fn test_admin_release_emits_admin_override_event() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
+
+    client.admin_release(&id, &true);
+
+    let event_name: Val = Symbol::new(&env, "AdminOverride").into_val(&env);
+    let events = env.events().all();
+    let ao_event = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|topic| topic == &event_name)
+    });
+    assert!(ao_event.is_some(), "AdminOverride event not emitted");
+    let (_, _, data) = ao_event.unwrap();
+    let payload: AdminOverride = soroban_sdk::from_val(&env, data);
+    assert_eq!(payload.escrow_id, id);
+    assert_eq!(payload.admin, admin);
+    assert_eq!(payload.to_agent, true);
+    assert_eq!(payload.amount, amount);
 }

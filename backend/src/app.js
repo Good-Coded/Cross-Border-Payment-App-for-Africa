@@ -63,19 +63,34 @@ app.use(cookieParser());
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
-      defaultSrc: ["'self'"],
+      defaultSrc: ["'none'"],
       scriptSrc: ["'self'"],
-      styleSrc: ["'self'"],
+      connectSrc: ["'self'", 'https://horizon.stellar.org', 'wss://horizon.stellar.org'],
       imgSrc: ["'self'", 'data:'],
-      connectSrc: ["'self'", 'https://horizon-testnet.stellar.org', 'https://horizon.stellar.org'],
-      fontSrc: ["'self'"],
-      objectSrc: ["'none'"],
-      frameSrc: ["'none'"],
+      frameAncestors: ["'none'"],
     },
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true,
+  },
+  frameguard: { action: 'deny' },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  permissionsPolicy: {
+    camera: [],
+    microphone: [],
+    geolocation: [],
+    payment: [],
   },
 }));
 app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true, maxAge: 86400 }));
 app.use(express.json());
+
+app.use((req, res, next) => {
+  res.removeHeader('Server');
+  next();
+});
 
 // Granular per-endpoint rate limiting (Redis-backed when REDIS_URL is set)
 app.use('/api/auth/login', rateLimiters.authLimiter);
@@ -170,6 +185,10 @@ const swaggerOptions = {
 
 const specs = swaggerJsdoc(swaggerOptions);
 
+app.use('/api/docs', (req, res, next) => {
+  res.removeHeader('Content-Security-Policy');
+  next();
+});
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(specs));
 
 /**
@@ -225,6 +244,7 @@ app.get('/health/deep', deepHealthLimiter, async (req, res) => {
   } catch {
     res.status(503).json({ status: 'unhealthy' });
   }
+});
 app.get('/api/health/ledger-listener', (req, res) => {
   res.json(getLedgerHealth());
 });

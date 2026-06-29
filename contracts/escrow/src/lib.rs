@@ -44,6 +44,14 @@ pub struct EscrowCancelled {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct EscrowExpired {
+    pub escrow_id: u64,
+    pub sender: Address,
+    pub refund_amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct DeliveryConfirmed {
     pub escrow_id: u64,
     pub agent: Address,
@@ -602,7 +610,7 @@ impl EscrowContract {
         }
 
         let now = env.ledger().timestamp();
-        if now < escrow.expires_at {
+        if now <= escrow.expires_at {
             panic!("Escrow has not expired yet");
         }
 
@@ -627,8 +635,8 @@ impl EscrowContract {
             (Symbol::new(&env, "EscrowExpired"),),
             EscrowExpired {
                 escrow_id,
+                sender: escrow.sender.clone(),
                 refund_amount: escrow.amount,
-                expired_at: now,
             },
         );
     }
