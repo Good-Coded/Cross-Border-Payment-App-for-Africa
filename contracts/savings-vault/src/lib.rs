@@ -21,36 +21,118 @@ pub struct WithdrawalEvent {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct AccrueInterestEvent {
+    pub user: Address,
+    pub interest: i128,
+    pub new_balance: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct Vault {
     pub balance: i128,
     pub unlock_time: u64,
+    pub last_accrue_time: u64,
 }
 
-// Storage keys
 #[contracttype]
 pub enum DataKey {
+    Admin,
     TokenAddress,
+    InterestRateBps,
+    PenaltyBps,
     Vault(Address),
 }
 
-// Penalty percentage for early withdrawal: 10%
-const EARLY_WITHDRAWAL_PENALTY_BPS: u32 = 1000; // 10% in basis points
+const SECONDS_PER_YEAR: u64 = 31_536_000;
 
 #[contract]
 pub struct SavingsVaultContract;
 
 #[contractimpl]
 impl SavingsVaultContract {
-    /// Initialize the contract with the token address (USDC)
-    pub fn initialize(env: Env, token_address: Address) {
+    pub fn initialize(env: Env, admin: Address, token_address: Address, penalty_bps: u32) {
         if env.storage().persistent().has(&DataKey::TokenAddress) {
             panic!("Contract already initialized");
         }
+        env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::TokenAddress, &token_address);
+        env.storage().persistent().set(&DataKey::PenaltyBps, &penalty_bps);
     }
 
-    /// Deposit funds into the vault with a lock period
-    /// The unlock_time is the ledger timestamp when funds can be withdrawn without penalty
+    /// Set the annual interest rate. Only admin may call this.
+    pub fn set_interest_rate(env: Env, admin: Address, rate_bps: u32) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        env.storage().persistent().set(&DataKey::InterestRateBps, &rate_bps);
+    }
+
+    /// Accrue interest for a single depositor.
+    ///
+    /// Calculates interest = balance * rate_bps * elapsed_seconds / (10000 * seconds_per_year)
+    /// and credits it to the vault's internal balance. The contract must hold sufficient
+    /// USDC to cover the increased balance when the user later withdraws.
+    pub fn accrue_interest(env: Env, admin: Address, user: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+
+        let rate_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InterestRateBps)
+            .unwrap_or(0);
+        if rate_bps == 0 {
+            panic!("interest rate not set");
+        }
+
+        let mut vault: Vault = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vault(user.clone()))
+            .expect("No vault found for user");
+
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(vault.last_accrue_time);
+
+        let interest = (vault.balance * rate_bps as i128 * elapsed as i128)
+            / (10_000i128 * SECONDS_PER_YEAR as i128);
+
+        if interest <= 0 {
+            return;
+        }
+
+        vault.balance += interest;
+        vault.last_accrue_time = now;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Vault(user.clone()), &vault);
+
+        env.events().publish(
+            (Symbol::new(&env, "AccrueInterest"),),
+            AccrueInterestEvent {
+                user,
+                interest,
+                new_balance: vault.balance,
+            },
+        );
+    }
+
+    /// Deposit tokens into the vault. Accumulates on top of any existing balance.
+    /// Extends the unlock time only if the new unlock_time is later than the current one.
     pub fn deposit(env: Env, user: Address, amount: i128, unlock_time: u64) {
         user.require_auth();
         if amount <= 0 {
@@ -66,7 +148,6 @@ impl SavingsVaultContract {
             .get(&DataKey::TokenAddress)
             .expect("Contract not initialized");
 
-        // Transfer tokens from user to contract
         token::Client::new(&env, &token_address).transfer_from(
             &env.current_contract_address(),
             &user,
@@ -74,7 +155,7 @@ impl SavingsVaultContract {
             &amount,
         );
 
-        // Get existing vault or create new one
+        let now = env.ledger().timestamp();
         let mut vault = env
             .storage()
             .persistent()
@@ -82,10 +163,10 @@ impl SavingsVaultContract {
             .unwrap_or(Vault {
                 balance: 0,
                 unlock_time: 0,
+                last_accrue_time: now,
             });
 
         vault.balance += amount;
-        // Update unlock_time if this deposit has a later unlock time
         if unlock_time > vault.unlock_time {
             vault.unlock_time = unlock_time;
         }
@@ -104,8 +185,6 @@ impl SavingsVaultContract {
         );
     }
 
-    /// Withdraw funds from the vault
-    /// If withdrawing before unlock_time, apply 10% penalty
     pub fn withdraw(env: Env, user: Address, amount: i128) {
         user.require_auth();
         if amount <= 0 {
@@ -128,17 +207,21 @@ impl SavingsVaultContract {
             .get(&DataKey::TokenAddress)
             .unwrap();
 
+        let penalty_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PenaltyBps)
+            .unwrap_or(1000);
+
         let now = env.ledger().timestamp();
         let penalty = if now < vault.unlock_time {
-            // Early withdrawal: 10% penalty
-            (amount * EARLY_WITHDRAWAL_PENALTY_BPS as i128) / 10000
+            (amount * penalty_bps as i128) / 10000
         } else {
             0
         };
 
         let withdraw_amount = amount - penalty;
 
-        // Transfer tokens back to user
         token::Client::new(&env, &token_address).transfer(
             &env.current_contract_address(),
             &user,
@@ -160,7 +243,6 @@ impl SavingsVaultContract {
         );
     }
 
-    /// Get the balance and unlock time for a user
     pub fn get_balance(env: Env, user: Address) -> i128 {
         env.storage()
             .persistent()
@@ -169,12 +251,23 @@ impl SavingsVaultContract {
             .unwrap_or(0)
     }
 
-    /// Get the unlock time for a user's vault
     pub fn get_unlock_time(env: Env, user: Address) -> u64 {
         env.storage()
             .persistent()
             .get(&DataKey::Vault(user))
             .map(|v: Vault| v.unlock_time)
             .unwrap_or(0)
+    }
+
+    /// Returns the full vault state for a user, or a zero-valued Vault if none exists.
+    pub fn get_vault(env: Env, user: Address) -> Vault {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Vault(user))
+            .unwrap_or(Vault {
+                balance: 0,
+                unlock_time: 0,
+                last_accrue_time: 0,
+            })
     }
 }

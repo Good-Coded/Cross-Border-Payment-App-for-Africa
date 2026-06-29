@@ -1,12 +1,13 @@
 const db = require('../db');
 const { getStellarStats } = require('../services/stellar');
+const { attestKyc, revokeKyc } = require('../services/kycAttestation');
+const audit = require('../services/audit');
 
 // Cache for Stellar stats (10 seconds)
 let stellarStatsCache = null;
 let stellarStatsCacheTime = 0;
 const CACHE_DURATION = 10000; // 10 seconds
 const { clawbackAsset } = require('../services/stellar');
-const audit = require('../services/audit');
 
 async function getStats(req, res, next) {
   try {
@@ -106,6 +107,28 @@ async function getTransactions(req, res, next) {
 
 
 
+async function getDailyTransactionStats(req, res, next) {
+  try {
+    const days = Math.min(parseInt(req.query.days) || 30, 90);
+    const from = new Date();
+    from.setDate(from.getDate() - days);
+    const { rows } = await db.query(`
+      SELECT
+        DATE(created_at)                                               AS date,
+        COUNT(*)                                                       AS tx_count,
+        COALESCE(SUM(amount), 0)                                       AS volume,
+        COALESCE(SUM(fee_amount), 0)                                   AS fees
+      FROM transactions
+      WHERE created_at >= $1 AND status = 'completed'
+      GROUP BY DATE(created_at)
+      ORDER BY date ASC
+    `, [from]);
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function getStellarNetworkStats(req, res, next) {
   try {
     const now = Date.now();
@@ -171,11 +194,8 @@ async function clawback(req, res, next) {
   }
 }
 
-module.exports = { getStats, getUsers, getTransactions, clawback };
+module.exports = { getStats, getUsers, getTransactions, getDailyTransactionStats, clawback };
 
-
-
-const { attestKyc, revokeKyc } = require('../services/kycAttestation');
 
 /**
  * POST /api/admin/kyc/:userId/approve
@@ -581,6 +601,70 @@ async function getContractEventsEndpoint(req, res, next) {
 }
 
 /**
+ * GET /api/admin/contracts/events
+ * Query contract events across all contracts with optional filtering.
+ * Query params: contractAddress, eventType, limit, offset, from, to
+ */
+async function getContractEventsGlobalEndpoint(req, res, next) {
+  try {
+    const { contractAddress, eventType, limit, offset, from, to } = req.query;
+
+    const maxLimit = Math.min(parseInt(limit) || 100, 500);
+    const offsetVal = parseInt(offset) || 0;
+
+    const params = [];
+    let query = 'SELECT * FROM contract_events WHERE 1=1';
+    let countQuery = 'SELECT COUNT(*) AS count FROM contract_events WHERE 1=1';
+
+    if (contractAddress) {
+      params.push(contractAddress);
+      const cond = ` AND contract_id = $${params.length}`;
+      query += cond;
+      countQuery += cond;
+    }
+
+    if (eventType) {
+      params.push(eventType);
+      const cond = ` AND event_type = $${params.length}`;
+      query += cond;
+      countQuery += cond;
+    }
+
+    if (from) {
+      params.push(new Date(from).toISOString());
+      const cond = ` AND created_at >= $${params.length}`;
+      query += cond;
+      countQuery += cond;
+    }
+
+    if (to) {
+      params.push(new Date(to).toISOString());
+      const cond = ` AND created_at <= $${params.length}`;
+      query += cond;
+      countQuery += cond;
+    }
+
+    const countParams = [...params];
+    params.push(maxLimit, offsetVal);
+    query += ` ORDER BY ledger_sequence DESC LIMIT $${params.length - 1} OFFSET $${params.length}`;
+
+    const [result, countResult] = await Promise.all([
+      db.query(query, params),
+      db.query(countQuery, countParams),
+    ]);
+
+    res.json({
+      events: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: maxLimit,
+      offset: offsetVal,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
  * POST /api/admin/contracts/:contractId/events/index
  * Manually trigger event indexing for a specific contract.
  */
@@ -605,10 +689,226 @@ async function indexContractEventsEndpoint(req, res, next) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fraud Rule Engine (#690)
+// ---------------------------------------------------------------------------
+const { loadRules, invalidateRulesCache } = require('../services/fraudDetection');
+
+async function getFraudRules(req, res, next) {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, name, rule_type, parameters, is_active, created_at FROM fraud_rules ORDER BY created_at ASC`
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function createFraudRule(req, res, next) {
+  try {
+    const { name, rule_type, parameters } = req.body;
+    const { rows } = await db.query(
+      `INSERT INTO fraud_rules (name, rule_type, parameters)
+       VALUES ($1, $2, $3) RETURNING *`,
+      [name, rule_type, JSON.stringify(parameters)]
+    );
+    await invalidateRulesCache();
+    await audit.log(req.user.userId, 'fraud_rule_created', req.ip, req.headers['user-agent'],
+      { rule_name: name, rule_type });
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Rule name already exists' });
+    next(err);
+  }
+}
+
+async function updateFraudRule(req, res, next) {
+  try {
+    const { id } = req.params;
+    const { name, parameters, is_active } = req.body;
+    const { rows } = await db.query(
+      `UPDATE fraud_rules
+       SET name = COALESCE($1, name),
+           parameters = COALESCE($2, parameters),
+           is_active = COALESCE($3, is_active),
+           updated_at = NOW()
+       WHERE id = $4 RETURNING *`,
+      [name || null, parameters ? JSON.stringify(parameters) : null, is_active ?? null, id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Rule not found' });
+    await invalidateRulesCache();
+    await audit.log(req.user.userId, 'fraud_rule_updated', req.ip, req.headers['user-agent'],
+      { rule_id: id, changes: req.body });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk User Management (#692)
+// ---------------------------------------------------------------------------
+const { sendEmail } = require('../services/email');
+
+const BULK_MAX = 500;
+
+function validateBulkRequest(req, res) {
+  const { userIds } = req.body;
+  if (!Array.isArray(userIds) || userIds.length === 0) {
+    res.status(400).json({ error: 'userIds must be a non-empty array' });
+    return false;
+  }
+  if (userIds.length > BULK_MAX) {
+    res.status(400).json({ error: `Batch size exceeds maximum of ${BULK_MAX}` });
+    return false;
+  }
+  return true;
+}
+
+async function bulkSuspend(req, res, next) {
+  if (!validateBulkRequest(req, res)) return;
+  const { userIds, reason } = req.body;
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE users SET is_suspended = true, suspension_reason = $1, suspended_at = NOW()
+       WHERE id = ANY($2::uuid[]) AND is_suspended = false`,
+      [reason || null, userIds]
+    );
+    await client.query('COMMIT');
+
+    await audit.log(req.user.userId, 'bulk_suspend', req.ip, req.headers['user-agent'],
+      { user_count: userIds.length, reason: reason || null });
+
+    // Queue suspension emails (fire-and-forget)
+    db.query('SELECT email, full_name FROM users WHERE id = ANY($1::uuid[])', [userIds])
+      .then(({ rows }) => rows.forEach(u =>
+        sendEmail(u.email, 'Account Suspended',
+          `Hello ${u.full_name || 'user'}, your account has been suspended. Reason: ${reason || 'Policy violation'}.`)
+          .catch(() => {})
+      ))
+      .catch(() => {});
+
+    res.json({ message: 'Users suspended', count: userIds.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+}
+
+async function bulkUnsuspend(req, res, next) {
+  if (!validateBulkRequest(req, res)) return;
+  const { userIds } = req.body;
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE users SET is_suspended = false, suspension_reason = NULL, suspended_at = NULL
+       WHERE id = ANY($1::uuid[]) AND is_suspended = true`,
+      [userIds]
+    );
+    await client.query('COMMIT');
+    await audit.log(req.user.userId, 'bulk_unsuspend', req.ip, req.headers['user-agent'],
+      { user_count: userIds.length });
+    res.json({ message: 'Users unsuspended', count: userIds.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+}
+
+async function bulkExport(req, res, next) {
+  if (!validateBulkRequest(req, res)) return;
+  const { userIds } = req.body;
+  try {
+    const { rows } = await db.query(
+      `INSERT INTO export_jobs (admin_id, status, operation, filters)
+       VALUES ($1, 'pending', 'bulk_export', $2) RETURNING id`,
+      [req.user.userId, JSON.stringify({ userIds })]
+    );
+    const jobId = rows[0].id;
+    await audit.log(req.user.userId, 'bulk_export_queued', req.ip, req.headers['user-agent'],
+      { user_count: userIds.length, job_id: jobId });
+
+    // Process async (fire-and-forget)
+    processBulkExportJob(jobId, userIds).catch(err =>
+      db.query(`UPDATE export_jobs SET status='failed', error=$1 WHERE id=$2`,
+        [err.message, jobId]).catch(() => {})
+    );
+
+    res.status(202).json({ jobId, message: 'Export job queued' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function processBulkExportJob(jobId, userIds) {
+  await db.query(`UPDATE export_jobs SET status='processing' WHERE id=$1`, [jobId]);
+  const { rows } = await db.query(
+    `SELECT u.id, u.full_name, u.email, u.phone, u.role, u.kyc_status, u.created_at, w.public_key
+     FROM users u LEFT JOIN wallets w ON w.user_id = u.id
+     WHERE u.id = ANY($1::uuid[])`,
+    [userIds]
+  );
+  // Store as JSON download URL (in production this would upload to S3)
+  const downloadUrl = `data:application/json;base64,${Buffer.from(JSON.stringify(rows)).toString('base64')}`;
+  await db.query(
+    `UPDATE export_jobs SET status='completed', download_url=$1, completed_at=NOW() WHERE id=$2`,
+    [downloadUrl, jobId]
+  );
+}
+
+async function getJobStatus(req, res, next) {
+  try {
+    const { jobId } = req.params;
+    const { rows } = await db.query(
+      `SELECT id, status, operation, download_url, error, created_at, completed_at FROM export_jobs WHERE id=$1`,
+      [jobId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Job not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function bulkKycUpdate(req, res, next) {
+  if (!validateBulkRequest(req, res)) return;
+  const { userIds, status, reason } = req.body;
+  if (!['approved', 'rejected'].includes(status)) {
+    return res.status(400).json({ error: 'status must be approved or rejected' });
+  }
+  const kycStatus = status === 'approved' ? 'verified' : 'rejected';
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE users SET kyc_status = $1, updated_at = NOW() WHERE id = ANY($2::uuid[])`,
+      [kycStatus, userIds]
+    );
+    await client.query('COMMIT');
+    await audit.log(req.user.userId, 'bulk_kyc_update', req.ip, req.headers['user-agent'],
+      { user_count: userIds.length, status: kycStatus, reason: reason || null });
+    res.json({ message: 'KYC status updated', count: userIds.length, status: kycStatus });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   getStats,
   getUsers,
   getTransactions,
+  getDailyTransactionStats,
   clawback,
   approveKYC,
   revokeKYC,
@@ -617,5 +917,16 @@ module.exports = {
   executeContractUpgrade,
   getContractUpgradeStatus,
   getContractEventsEndpoint,
-  indexContractEventsEndpoint
+  getContractEventsGlobalEndpoint,
+  indexContractEventsEndpoint,
+  // #690
+  getFraudRules,
+  createFraudRule,
+  updateFraudRule,
+  // #692
+  bulkSuspend,
+  bulkUnsuspend,
+  bulkExport,
+  getJobStatus,
+  bulkKycUpdate,
 };
