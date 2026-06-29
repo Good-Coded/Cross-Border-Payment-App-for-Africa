@@ -115,9 +115,9 @@ async function sendVerificationEmail(email, token) {
 }
 
 async function sendExpiryNotification(email, name, recipientWallet, amount, asset, daysLeft, type) {
-  const subject = type === 'sender' 
-    ? `⚠️ Your claimable balance expires in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`
-    : `💰 You have unclaimed funds expiring in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`;
+  const subject = type === 'sender'
+    ? `Your claimable balance expires in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`
+    : `You have unclaimed funds expiring in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`;
 
   const message = type === 'sender'
     ? `<p>Hi ${name},</p>
@@ -126,7 +126,7 @@ async function sendExpiryNotification(email, name, recipientWallet, amount, asse
        <p>Transaction details: <a href="${process.env.FRONTEND_URL}/history">View in AfriPay</a></p>`
     : `<p>Hi ${name},</p>
        <p>You have unclaimed funds of <strong>${amount} ${asset}</strong> waiting for you!</p>
-       <p>⚠️ These funds will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong> if not claimed.</p>
+       <p>These funds will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong> if not claimed.</p>
        <p><a href="${process.env.FRONTEND_URL}/dashboard">Claim your funds now</a></p>`;
 
   await transporter.sendMail({
@@ -179,7 +179,6 @@ async function sendTransactionEmail(email, type, tx) {
   const subject = isSent
     ? `AfriPay: You sent ${tx.amount} ${tx.asset}`
     : `AfriPay: You received ${tx.amount} ${tx.asset}`;
-
   const counterpartyLabel = isSent ? 'Recipient' : 'Sender';
   const counterpartyAddress = isSent ? tx.recipientAddress : tx.senderAddress;
 
@@ -228,6 +227,41 @@ async function sendTransactionEmail(email, type, tx) {
     </div>
   `;
 
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject,
+    html,
+  });
+}
+
+async function sendPaymentRequestExpiredEmail(email, amount, asset) {
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: 'Your AfriPay payment request has expired',
+    html: `<p>Your payment request for <strong>${amount} ${asset}</strong> has expired and is no longer active.</p>
+           <p>You can create a new payment request from your AfriPay dashboard.</p>`,
+  });
+}
+
+async function sendBackupCodeWarningEmail(email, remaining) {
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: 'AfriPay: Low 2FA backup codes remaining',
+    html: `<p>You only have <strong>${remaining}</strong> backup code${remaining === 1 ? '' : 's'} remaining for your AfriPay account.</p>
+           <p>Please regenerate your backup codes from your security settings to avoid being locked out.</p>`,
+  });
+}
+
+module.exports = {
+  sendVerificationEmail,
+  sendExpiryNotification,
+  sendPasswordResetEmail,
+  sendTransactionEmail,
+  sendPaymentRequestExpiredEmail,
+  sendBackupCodeWarningEmail,
   return enqueueEmail({ to: email, subject, html });
 }
 

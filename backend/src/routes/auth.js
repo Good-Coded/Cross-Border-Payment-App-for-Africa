@@ -21,6 +21,8 @@ const {
   disable2FA,
   forgotPassword,
   resetPassword,
+  regenerateBackupCodes,
+  getBackupCodeCount,
   changePassword,
   validateResetToken,
 } = require('../controllers/authController');
@@ -157,6 +159,17 @@ router.post(
   disable2FA
 );
 
+router.post(
+  '/2fa/backup-codes/regenerate',
+  authMiddleware,
+  [body('totp_code').matches(/^\d{6}$/).withMessage('TOTP code must be 6 digits')],
+  validate,
+  regenerateBackupCodes
+);
+
+router.get('/2fa/backup-codes/count', authMiddleware, getBackupCodeCount);
+
+const { listSessions, revokeSession, revokeAllSessions } = require('../controllers/sessionController');
 // Avatar upload — 5 MB limit, memory storage (magic bytes checked in controller)
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
