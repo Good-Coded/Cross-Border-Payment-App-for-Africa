@@ -36,6 +36,9 @@ pub struct Attestation {
     pub attested_at: u64,
     /// Unix timestamp when the attestation was revoked, or 0 if still active.
     pub revoked_at: u64,
+    /// Unix ledger timestamp after which the attestation is considered expired.
+    /// 0 means the attestation never expires.
+    pub expires_at: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -62,10 +65,12 @@ impl KycAttestationContract {
     /// (non-revoked) attestation.
     ///
     /// # Arguments
-    /// * `admin`    — Must match the admin set during `initialize`.
-    /// * `user`     — Stellar address of the verified user.
-    /// * `kyc_hash` — SHA-256 hash of the KYC document bundle. Never raw PII.
-    pub fn attest(env: Env, admin: Address, user: Address, kyc_hash: Bytes) {
+    /// * `admin`      — Must match the admin set during `initialize`.
+    /// * `user`       — Stellar address of the verified user.
+    /// * `kyc_hash`   — SHA-256 hash of the KYC document bundle. Never raw PII.
+    /// * `expires_at` — Ledger timestamp after which the attestation expires.
+    ///                  Pass 0 for no expiry.
+    pub fn attest(env: Env, admin: Address, user: Address, kyc_hash: Bytes, expires_at: u64) {
         admin.require_auth();
         Self::assert_admin(&env, &admin);
 
@@ -88,6 +93,7 @@ impl KycAttestationContract {
             kyc_hash,
             attested_at: env.ledger().timestamp(),
             revoked_at: 0,
+            expires_at,
         };
         env.storage()
             .persistent()
@@ -131,7 +137,7 @@ impl KycAttestationContract {
         );
     }
 
-    /// Returns `true` if `user` has a current, non-revoked KYC attestation.
+    /// Returns `true` if `user` has a current, non-revoked, non-expired KYC attestation.
     ///
     /// Public — any caller may invoke this.
     ///
@@ -143,8 +149,48 @@ impl KycAttestationContract {
             .persistent()
             .get::<_, Attestation>(&DataKey::Attestation(user))
         {
-            Some(record) => record.revoked_at == 0,
+            Some(record) => {
+                if record.revoked_at != 0 {
+                    return false;
+                }
+                if record.expires_at != 0 && env.ledger().timestamp() > record.expires_at {
+                    return false;
+                }
+                true
+            }
             None => false,
+        }
+    }
+
+    /// Revoke attestations for multiple users atomically.
+    ///
+    /// Only the admin may call this. Skips users with no active attestation
+    /// rather than panicking, to allow partial-valid batches.
+    ///
+    /// # Arguments
+    /// * `admin` — Must match the admin set during `initialize`.
+    /// * `users` — List of Stellar addresses to revoke.
+    pub fn revoke_batch(env: Env, admin: Address, users: soroban_sdk::Vec<Address>) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        let now = env.ledger().timestamp();
+        for user in users.iter() {
+            let key = DataKey::Attestation(user.clone());
+            if let Some(mut record) = env
+                .storage()
+                .persistent()
+                .get::<_, Attestation>(&key)
+            {
+                if record.revoked_at == 0 {
+                    record.revoked_at = now;
+                    env.storage().persistent().set(&key, &record);
+                    env.events().publish(
+                        (Symbol::new(&env, "KycRevoked"),),
+                        user,
+                    );
+                }
+            }
         }
     }
 
