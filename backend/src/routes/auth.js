@@ -17,6 +17,7 @@ const {
   disable2FA,
   forgotPassword,
   resetPassword,
+  changePassword,
 } = require('../controllers/authController');
 const authMiddleware = require('../middleware/auth');
 const geoRestriction = require('../middleware/geoRestriction');
@@ -116,9 +117,21 @@ router.post('/2fa/disable',
 
 const { listSessions, revokeSession, revokeAllSessions } = require('../controllers/sessionController');
 
-module.exports = router;
+// Change password — invalidates all other active sessions
+router.patch(
+  '/password',
+  authMiddleware,
+  [
+    body('current_password').notEmpty().withMessage('Current password is required'),
+    body('new_password').isLength({ min: 8 }).withMessage('New password must be at least 8 characters'),
+  ],
+  validate,
+  changePassword
+);
 
 // Session management routes (all require auth)
 router.get('/sessions', authMiddleware, listSessions);
 router.delete('/sessions', authMiddleware, revokeAllSessions);
 router.delete('/sessions/:id', authMiddleware, revokeSession);
+
+module.exports = router;
