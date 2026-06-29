@@ -1,5 +1,6 @@
 ﻿const { v4: uuidv4 } = require("uuid");
 const { stringify } = require("csv-stringify/sync");
+const { stringify: csvStream } = require("csv-stringify");
 const db = require("../db");
 const StellarSdk = require("@stellar/stellar-sdk");
 const {
@@ -855,21 +856,48 @@ async function pollTransactionConfirmation(txId, txHash) {
   await db.query(`UPDATE transactions SET status = 'failed', confirmed_at = NOW() WHERE id = $1`, [txId]);
 }
 
+const EXPORT_ROW_LIMIT = parseInt(process.env.EXPORT_ROW_LIMIT || "1000000", 10);
+const EXPORT_BATCH_SIZE = 500;
+
 async function exportCSV(req, res, next) {
+  const walletResult = await db.query(
+    "SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
+    [req.user.userId],
+  ).catch(() => null);
+
+  if (!walletResult?.rows[0]) return res.status(404).json({ error: "Wallet not found" });
+  const { public_key } = walletResult.rows[0];
+
+  const ALLOWED_STATUSES = ["pending", "completed", "cancelled", "failed"];
+  if (req.query.status && !ALLOWED_STATUSES.includes(req.query.status)) {
+    return res.status(400).json({ error: `Invalid status value. Must be one of: ${ALLOWED_STATUSES.join(", ")}` });
+  }
+
+  const sanitize = (s) => s.replace(/[^0-9a-zA-Z_\-]/g, "");
+  let filename;
+  if (req.query.from || req.query.to) {
+    const from = sanitize((req.query.from || "").slice(0, 10));
+    const to = sanitize((req.query.to || "").slice(0, 10));
+    filename = `transactions_${from}_to_${to}.csv`;
+  } else {
+    const today = new Date().toISOString().slice(0, 10);
+    filename = `transactions_exported_${today}.csv`;
+  }
+
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+  const stringifier = csvStream({
+    header: true,
+    columns: ["date", "direction", "amount", "asset", "recipient_or_sender", "memo", "tx_hash", "status"],
+  });
+  stringifier.pipe(res);
+
+  const client = await db.pool.connect();
+  let rowCount = 0;
+  let streamErrored = false;
+
   try {
-    const walletResult = await db.query(
-      "SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
-      [req.user.userId],
-    );
-    if (!walletResult.rows[0]) return res.status(404).json({ error: "Wallet not found" });
-
-    const { public_key } = walletResult.rows[0];
-
-    const ALLOWED_STATUSES = ["pending", "completed", "cancelled", "failed"];
-    if (req.query.status && !ALLOWED_STATUSES.includes(req.query.status)) {
-      return res.status(400).json({ error: `Invalid status value. Must be one of: ${ALLOWED_STATUSES.join(", ")}` });
-    }
-
     const params = [public_key];
     let filters = "";
     if (req.query.from) { params.push(req.query.from); filters += ` AND created_at >= $${params.length}`; }
@@ -878,46 +906,58 @@ async function exportCSV(req, res, next) {
     if (req.query.direction === "sent") filters += " AND sender_wallet = $1";
     else if (req.query.direction === "received") filters += " AND recipient_wallet = $1";
 
-    const result = await db.query(
-      `SELECT created_at, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status
+    await client.query("BEGIN");
+    await client.query(
+      `DECLARE txexport CURSOR FOR
+       SELECT created_at, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status
        FROM transactions
        WHERE (sender_wallet = $1 OR recipient_wallet = $1)${filters}
-       ORDER BY created_at DESC`,
+       ORDER BY created_at DESC
+       LIMIT ${EXPORT_ROW_LIMIT}`,
       params,
     );
 
-    const rows = result.rows.map((tx) => ({
-      date: new Date(tx.created_at).toISOString(),
-      direction: tx.sender_wallet === public_key ? "sent" : "received",
-      amount: tx.amount,
-      asset: tx.asset,
-      recipient_or_sender: tx.sender_wallet === public_key ? tx.recipient_wallet : tx.sender_wallet,
-      memo: tx.memo || "",
-      tx_hash: tx.tx_hash || "",
-      status: tx.status,
-    }));
+    while (true) {
+      const batch = await client.query(`FETCH ${EXPORT_BATCH_SIZE} FROM txexport`);
+      if (batch.rows.length === 0) break;
 
-    res.setHeader("Content-Type", "text/csv");
-    // Build dynamic filename based on date range params; sanitize to prevent header injection
-    const sanitize = (s) => s.replace(/[^0-9a-zA-Z_\-]/g, "");
-    let filename;
-    if (req.query.from || req.query.to) {
-      const from = sanitize((req.query.from || "").slice(0, 10));
-      const to = sanitize((req.query.to || "").slice(0, 10));
-      filename = `transactions_${from}_to_${to}.csv`;
-    } else {
-      const today = new Date().toISOString().slice(0, 10);
-      filename = `transactions_exported_${today}.csv`;
+      for (const tx of batch.rows) {
+        stringifier.write({
+          date: new Date(tx.created_at).toISOString(),
+          direction: tx.sender_wallet === public_key ? "sent" : "received",
+          amount: tx.amount,
+          asset: tx.asset,
+          recipient_or_sender: tx.sender_wallet === public_key ? tx.recipient_wallet : tx.sender_wallet,
+          memo: tx.memo || "",
+          tx_hash: tx.tx_hash || "",
+          status: tx.status,
+        });
+      }
+
+      rowCount += batch.rows.length;
+      if (rowCount >= EXPORT_ROW_LIMIT) break;
     }
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
-    const output = stringify(rows, {
-      header: true,
-      columns: ["date", "direction", "amount", "asset", "recipient_or_sender", "memo", "tx_hash", "status"],
-    });
-    res.send(output);
+    await client.query("CLOSE txexport");
+    await client.query("COMMIT");
   } catch (err) {
-    next(err);
+    streamErrored = true;
+    logger.error("CSV export cursor error", { error: err.message });
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    // Append an error sentinel row so the client knows the export was interrupted
+    stringifier.write({
+      date: new Date().toISOString(),
+      direction: "ERROR",
+      amount: "",
+      asset: "",
+      recipient_or_sender: "",
+      memo: "ERROR: Export interrupted. Please retry.",
+      tx_hash: "",
+      status: "error",
+    });
+  } finally {
+    client.release();
+    stringifier.end();
   }
 }
 

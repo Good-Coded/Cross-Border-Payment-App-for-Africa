@@ -173,4 +173,35 @@ router.post(
   indexContractEventsEndpoint
 );
 
+// Email queue management (Issue #706)
+router.get('/email-queue/stats', async (req, res, next) => {
+  try {
+    const { getEmailQueue } = require('../services/email');
+    const queue = getEmailQueue();
+    if (!queue) return res.json({ status: 'disabled', message: 'Email queue not initialized (Redis unavailable)' });
+    const [waiting, active, completed, failed] = await Promise.all([
+      queue.getWaitingCount(),
+      queue.getActiveCount(),
+      queue.getCompletedCount(),
+      queue.getFailedCount(),
+    ]);
+    res.json({ waiting, active, completed, failed });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/email-queue/retry-failed', async (req, res, next) => {
+  try {
+    const { getEmailQueue } = require('../services/email');
+    const queue = getEmailQueue();
+    if (!queue) return res.status(503).json({ error: 'Email queue not initialized' });
+    const failedJobs = await queue.getFailed();
+    await Promise.all(failedJobs.map((job) => job.retry()));
+    res.json({ retried: failedJobs.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

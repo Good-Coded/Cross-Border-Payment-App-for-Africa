@@ -34,6 +34,8 @@ const db = require('./db');
 const app = require('./app');
 const { initStreams } = require('./services/horizonWorker');
 const { detectTestnetReset } = require('./services/stellar');
+const { initEmailQueue, drainEmailQueue } = require('./services/email');
+const { startPriceRefreshJob } = require('./services/priceOracle');
 const { syncOfferEvents } = require('./jobs/syncOfferEvents');
 const ledgerListener = require('./services/ledgerListener');
 const { Server: SocketIOServer } = require('socket.io');
@@ -41,6 +43,9 @@ const jwt = require('jsonwebtoken');
 
 const PORT = process.env.PORT || 5000;
 const SHUTDOWN_TIMEOUT_MS = 30_000;
+
+initEmailQueue();
+startPriceRefreshJob();
 
 const server = app.listen(PORT, () => {
   logger.info(`Server running on port ${PORT}`, { port: PORT });
@@ -124,6 +129,12 @@ app.listen(PORT, () => {
 
   server.close(async () => {
     clearTimeout(forceExit);
+    try {
+      await drainEmailQueue();
+      logger.info('Email queue drained');
+    } catch (err) {
+      logger.error('Error draining email queue', { message: err.message });
+    }
     try {
       await db.pool.end();
       logger.info('DB pool closed');
