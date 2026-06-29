@@ -32,6 +32,7 @@ const RESOLUTION_DEADLINE_SECS: u64 = 7 * 24 * 60 * 60;
 pub enum DataKey {
     Admin,
     Arbitrator,
+    PendingArbitrator,
     UsdcAddress,
     MaxEvidenceBytes,
     Counter,
@@ -399,13 +400,31 @@ impl DisputeResolutionContract {
             .expect("dispute not found")
     }
 
-    /// Update the arbitrator address. Only admin may call this.
-    pub fn set_arbitrator(env: Env, admin: Address, new_arbitrator: Address) {
+    /// Step 1 of two-step arbitrator handoff. Admin proposes a new arbitrator.
+    /// The proposal is stored but the active arbitrator is unchanged until the
+    /// nominee accepts.
+    pub fn propose_new_arbitrator(env: Env, admin: Address, new_arbitrator: Address) {
         admin.require_auth();
         let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             panic!("unauthorized: caller is not admin");
         }
+        env.storage().persistent().set(&DataKey::PendingArbitrator, &new_arbitrator);
+    }
+
+    /// Step 2 of two-step arbitrator handoff. The proposed address accepts and
+    /// becomes the active arbitrator, clearing the pending slot.
+    pub fn accept_arbitrator(env: Env, new_arbitrator: Address) {
+        new_arbitrator.require_auth();
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingArbitrator)
+            .expect("no pending arbitrator");
+        if new_arbitrator != pending {
+            panic!("caller is not the pending arbitrator");
+        }
         env.storage().persistent().set(&DataKey::Arbitrator, &new_arbitrator);
+        env.storage().persistent().remove(&DataKey::PendingArbitrator);
     }
 }

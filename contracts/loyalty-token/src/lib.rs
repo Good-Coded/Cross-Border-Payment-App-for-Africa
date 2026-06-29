@@ -39,6 +39,7 @@ pub enum DataKey {
     Admin,
     TotalSupply,
     MaxSupply,
+    TransferFeeBps,
     Balance(Address),
     Allowance(Address, Address), // (owner, spender)
 }
@@ -60,18 +61,24 @@ impl LoyaltyTokenContract {
     /// Initialise the contract. Must be called once before any other function.
     ///
     /// # Arguments
-    /// * `admin`      — Address authorised to mint tokens (the AfriPay backend).
-    /// * `max_supply` — Hard ceiling on total points that can ever be minted (must be > 0).
-    pub fn initialize(env: Env, admin: Address, max_supply: i128) {
+    /// * `admin`            — Address authorised to mint tokens (the AfriPay backend).
+    /// * `max_supply`       — Hard ceiling on total points that can ever be minted (must be > 0).
+    /// * `transfer_fee_bps` — Fee taken on peer transfers in basis points (0–10000). Fee is
+    ///                        credited to the admin. Pass 0 to disable fees.
+    pub fn initialize(env: Env, admin: Address, max_supply: i128, transfer_fee_bps: u32) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         if max_supply <= 0 {
             panic!("max_supply must be positive");
         }
+        if transfer_fee_bps > 10000 {
+            panic!("transfer_fee_bps must be <= 10000");
+        }
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::TotalSupply, &0i128);
         env.storage().persistent().set(&DataKey::MaxSupply, &max_supply);
+        env.storage().persistent().set(&DataKey::TransferFeeBps, &transfer_fee_bps);
     }
 
     // ── SEP-41: token metadata ────────────────────────────────────────────────
@@ -151,16 +158,36 @@ impl LoyaltyTokenContract {
     // ── SEP-41: transfers ─────────────────────────────────────────────────────
 
     /// Transfer `amount` points from the caller to `to`.
+    /// If a `transfer_fee_bps` was set at initialisation, the fee is deducted
+    /// from the transferred amount and credited to the admin.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
         }
         from.require_auth();
         Self::_debit(&env, &from, amount);
-        Self::_credit(&env, &to, amount);
+
+        let fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TransferFeeBps)
+            .unwrap_or(0);
+        let fee = if fee_bps > 0 { amount * fee_bps as i128 / 10000 } else { 0 };
+        let net = amount - fee;
+
+        Self::_credit(&env, &to, net);
+        if fee > 0 {
+            let admin: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Admin)
+                .expect("not initialized");
+            Self::_credit(&env, &admin, fee);
+        }
     }
 
     /// Transfer `amount` points from `from` to `to` using an allowance.
+    /// The fee (if any) is deducted from the transferred amount and credited to admin.
     pub fn transfer_from(
         env: Env,
         spender: Address,
@@ -194,7 +221,24 @@ impl LoyaltyTokenContract {
             });
 
         Self::_debit(&env, &from, amount);
-        Self::_credit(&env, &to, amount);
+
+        let fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TransferFeeBps)
+            .unwrap_or(0);
+        let fee = if fee_bps > 0 { amount * fee_bps as i128 / 10000 } else { 0 };
+        let net = amount - fee;
+
+        Self::_credit(&env, &to, net);
+        if fee > 0 {
+            let admin: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Admin)
+                .expect("not initialized");
+            Self::_credit(&env, &admin, fee);
+        }
     }
 
     // ── SEP-41: burn ──────────────────────────────────────────────────────────
