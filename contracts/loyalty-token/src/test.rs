@@ -432,3 +432,27 @@ fn test_mint_one_point_per_xlm_volume() {
     client.mint(&admin, &user, &xlm_amount);
     assert_eq!(client.balance(&user), 50);
 }
+
+// ── total_supply consistency ──────────────────────────────────────────────────
+
+#[test]
+fn test_total_supply_consistency_after_mint_transfer_burn_redeem() {
+    let (env, client, admin) = setup();
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+
+    client.mint(&admin, &user1, &200);
+    assert_eq!(client.total_supply(), client.balance(&user1) + client.balance(&user2));
+
+    client.mint(&admin, &user2, &100);
+    assert_eq!(client.total_supply(), client.balance(&user1) + client.balance(&user2));
+
+    client.transfer(&user1, &user2, &50);
+    assert_eq!(client.total_supply(), client.balance(&user1) + client.balance(&user2));
+
+    client.burn(&user1, &30);
+    assert_eq!(client.total_supply(), client.balance(&user1) + client.balance(&user2));
+
+    assert!(client.redeem(&user2)); // burns 100 from user2
+    assert_eq!(client.total_supply(), client.balance(&user1) + client.balance(&user2));
+}

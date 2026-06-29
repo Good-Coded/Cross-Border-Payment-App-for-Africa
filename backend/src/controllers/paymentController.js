@@ -1,4 +1,6 @@
 ﻿const { v4: uuidv4 } = require("uuid");
+const { stringify } = require("csv-stringify/sync");
+const { stringify: csvStream } = require("csv-stringify");
 const { stringify: stringifySync } = require("csv-stringify/sync");
 const { stringify: stringifyStream } = require("csv-stringify");
 const db = require("../db");
@@ -22,7 +24,7 @@ const { checkVelocity, checkDailyLimit } = require("../services/fraudDetection")
 const { checkFraud, logFraudBlock } = require("../services/fraudDetection");
 const { parseHistoryFrom, parseHistoryTo, normalizeAsset, validateDateRange } = require("../utils/historyQuery");
 const { isMemoRequired } = require("../services/memoRequired");
-const { awardReferralCredit } = require("./referralController");
+const { creditReferralReward } = require("../services/referralRewardService");
 const { mintPoints } = require("../services/loyaltyToken");
 const { depositFee } = require("../services/feeDistributor");
 const logger = require("../utils/logger");
@@ -35,6 +37,31 @@ const FEE_BPS = parseInt(process.env.FEE_BPS || "50", 10);
 
 function calculateFee(amount) {
   return parseFloat((parseFloat(amount) * FEE_BPS / 10000).toFixed(7));
+}
+
+/**
+ * Build the structured fee breakdown for a payment.
+ * @param {string|number} grossAmount  - Amount the sender sent
+ * @param {string}        asset        - e.g. "USDC" or "XLM"
+ * @param {string|null}   feeCharged   - Stellar fee_charged in stroops (from Horizon result)
+ */
+function buildFeeBreakdown(grossAmount, asset, feeCharged) {
+  const gross = parseFloat(grossAmount);
+  const PLATFORM_FEE_BPS = parseInt(process.env.PLATFORM_FEE_BPS || "250", 10);
+  const platformFee = parseFloat((gross * PLATFORM_FEE_BPS / 10000).toFixed(7));
+  const stellarBaseFeeXlm = feeCharged != null
+    ? parseFloat((parseInt(feeCharged, 10) / 1e7).toFixed(7))
+    : null;
+  const netAmount = parseFloat((gross - platformFee).toFixed(7));
+
+  return {
+    gross_amount_usdc: parseFloat(gross.toFixed(7)),
+    platform_fee_bps: PLATFORM_FEE_BPS,
+    platform_fee_usdc: platformFee,
+    stellar_base_fee_xlm: stellarBaseFeeXlm,
+    net_amount_usdc: parseFloat(netAmount.toFixed(7)),
+    asset,
+  };
 }
 
 // Approximate XLM/USD rate  in production replace with a live price feed
@@ -162,6 +189,29 @@ async function estimateFee(req, res, next) {
   try {
     const fee = await fetchFee();
     res.json({ fee_stroops: fee, fee_xlm: (fee / 1e7).toFixed(7) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/payments/estimate-fees?amount=100&asset=USDC
+ * Returns a pre-submission fee breakdown without processing a payment.
+ */
+async function estimateFees(req, res, next) {
+  try {
+    const { amount, asset = "USDC" } = req.query;
+    if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+      return res.status(400).json({ error: "amount must be a positive number" });
+    }
+    const VALID = ["XLM", "USDC", "NGN", "GHS", "KES"];
+    if (!VALID.includes(asset)) {
+      return res.status(400).json({ error: `asset must be one of: ${VALID.join(", ")}` });
+    }
+    let stellarFeeStroops = null;
+    try { stellarFeeStroops = await fetchFee(); } catch (_) { /* non-fatal */ }
+    const breakdown = buildFeeBreakdown(amount, asset, stellarFeeStroops);
+    res.json({ fee_breakdown: breakdown });
   } catch (err) {
     next(err);
   }
@@ -314,7 +364,7 @@ async function send(req, res, next) {
     await checkSufficientBalance(public_key, amount, asset);
 
     // Broadcast to Stellar
-    const { transactionHash, ledger, type, claimableBalanceId } = await sendPayment({
+    const { transactionHash, ledger, type, claimableBalanceId, feeCharged } = await sendPayment({
       senderPublicKey: public_key,
       encryptedSecretKey: encrypted_secret_key,
       recipientPublicKey: recipient_address,
@@ -327,12 +377,15 @@ async function send(req, res, next) {
 
     const ledger_close_time = await fetchLedgerCloseTime(ledger);
 
+    // Build fee breakdown
+    const fee_breakdown = buildFeeBreakdown(amount, asset, feeCharged ?? null);
+
     // Save to DB
     const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
     await db.query(
-      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-      [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time],
+      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+      [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(fee_breakdown)],
     );
 
     if (type !== "claimable_balance") {
@@ -346,7 +399,7 @@ async function send(req, res, next) {
       [public_key],
     );
     if (parseInt(txCount.rows[0].cnt, 10) === 1) {
-      awardReferralCredit(req.user.userId).catch(() => {});
+      creditReferralReward(req.user.userId, txId).catch(() => {});
     }
 
     const loyaltyPoints = Math.max(1, Math.floor(parseFloat(amount)));
@@ -391,6 +444,7 @@ async function send(req, res, next) {
         recipient: recipient_address,
         type,
         claimableBalanceId,
+        fee_breakdown,
       },
     });
   } catch (err) {
@@ -626,7 +680,7 @@ async function history(req, res, next) {
     }
     const whereClause = conditions.join(" AND ");
 
-    const listSql = `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, created_at, ledger_close_time
+    const listSql = `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, created_at, ledger_close_time, fee_breakdown
          FROM transactions
          WHERE ${whereClause}
          ORDER BY id DESC LIMIT $${baseParams.length + 1}`;
@@ -891,7 +945,14 @@ async function pollTransactionConfirmation(txId, txHash) {
   await db.query(`UPDATE transactions SET status = 'failed', confirmed_at = NOW() WHERE id = $1`, [txId]);
 }
 
+const EXPORT_ROW_LIMIT = parseInt(process.env.EXPORT_ROW_LIMIT || "1000000", 10);
+const EXPORT_BATCH_SIZE = 500;
+
 async function exportCSV(req, res, next) {
+  const walletResult = await db.query(
+    "SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
+    [req.user.userId],
+  ).catch(() => null);
   let client;
   try {
     const walletResult = await db.query(
@@ -900,13 +961,39 @@ async function exportCSV(req, res, next) {
     );
     if (!walletResult.rows[0]) return res.status(404).json({ error: "Wallet not found" });
 
-    const { public_key } = walletResult.rows[0];
+  if (!walletResult?.rows[0]) return res.status(404).json({ error: "Wallet not found" });
+  const { public_key } = walletResult.rows[0];
 
-    const ALLOWED_STATUSES = ["pending", "completed", "cancelled", "failed"];
-    if (req.query.status && !ALLOWED_STATUSES.includes(req.query.status)) {
-      return res.status(400).json({ error: `Invalid status value. Must be one of: ${ALLOWED_STATUSES.join(", ")}` });
-    }
+  const ALLOWED_STATUSES = ["pending", "completed", "cancelled", "failed"];
+  if (req.query.status && !ALLOWED_STATUSES.includes(req.query.status)) {
+    return res.status(400).json({ error: `Invalid status value. Must be one of: ${ALLOWED_STATUSES.join(", ")}` });
+  }
 
+  const sanitize = (s) => s.replace(/[^0-9a-zA-Z_\-]/g, "");
+  let filename;
+  if (req.query.from || req.query.to) {
+    const from = sanitize((req.query.from || "").slice(0, 10));
+    const to = sanitize((req.query.to || "").slice(0, 10));
+    filename = `transactions_${from}_to_${to}.csv`;
+  } else {
+    const today = new Date().toISOString().slice(0, 10);
+    filename = `transactions_exported_${today}.csv`;
+  }
+
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+  const stringifier = csvStream({
+    header: true,
+    columns: ["date", "direction", "amount", "asset", "recipient_or_sender", "memo", "tx_hash", "status"],
+  });
+  stringifier.pipe(res);
+
+  const client = await db.pool.connect();
+  let rowCount = 0;
+  let streamErrored = false;
+
+  try {
     const params = [public_key];
     let filters = "";
     if (req.query.from) { params.push(req.query.from); filters += ` AND created_at >= $${params.length}`; }
@@ -915,6 +1002,58 @@ async function exportCSV(req, res, next) {
     if (req.query.direction === "sent") filters += " AND sender_wallet = $1";
     else if (req.query.direction === "received") filters += " AND recipient_wallet = $1";
 
+    await client.query("BEGIN");
+    await client.query(
+      `DECLARE txexport CURSOR FOR
+       SELECT created_at, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status
+       FROM transactions
+       WHERE (sender_wallet = $1 OR recipient_wallet = $1)${filters}
+       ORDER BY created_at DESC
+       LIMIT ${EXPORT_ROW_LIMIT}`,
+      params,
+    );
+
+    while (true) {
+      const batch = await client.query(`FETCH ${EXPORT_BATCH_SIZE} FROM txexport`);
+      if (batch.rows.length === 0) break;
+
+      for (const tx of batch.rows) {
+        stringifier.write({
+          date: new Date(tx.created_at).toISOString(),
+          direction: tx.sender_wallet === public_key ? "sent" : "received",
+          amount: tx.amount,
+          asset: tx.asset,
+          recipient_or_sender: tx.sender_wallet === public_key ? tx.recipient_wallet : tx.sender_wallet,
+          memo: tx.memo || "",
+          tx_hash: tx.tx_hash || "",
+          status: tx.status,
+        });
+      }
+
+      rowCount += batch.rows.length;
+      if (rowCount >= EXPORT_ROW_LIMIT) break;
+    }
+
+    await client.query("CLOSE txexport");
+    await client.query("COMMIT");
+  } catch (err) {
+    streamErrored = true;
+    logger.error("CSV export cursor error", { error: err.message });
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    // Append an error sentinel row so the client knows the export was interrupted
+    stringifier.write({
+      date: new Date().toISOString(),
+      direction: "ERROR",
+      amount: "",
+      asset: "",
+      recipient_or_sender: "",
+      memo: "ERROR: Export interrupted. Please retry.",
+      tx_hash: "",
+      status: "error",
+    });
+  } finally {
+    client.release();
+    stringifier.end();
     // Build filename before streaming starts
     const sanitize = (s) => s.replace(/[^0-9a-zA-Z_\-]/g, "");
     let filename;
@@ -986,4 +1125,36 @@ async function exportCSV(req, res, next) {
   }
 }
 
-module.exports = { send, sendBatch, history, findPath, sendPath, exportCSV, estimateFee, getFeeStats, getFeeRate, findReceivePathHandler, sendStrictReceivePath };
+/**
+ * GET /api/payments/:id
+ * Returns a single payment record for the authenticated user, including fee_breakdown.
+ */
+async function getPaymentById(req, res, next) {
+  try {
+    const walletResult = await db.query(
+      "SELECT public_key FROM wallets WHERE user_id = $1",
+      [req.user.userId],
+    );
+    const publicKeys = walletResult.rows.map((r) => r.public_key);
+    if (publicKeys.length === 0) return res.status(404).json({ error: "Wallet not found" });
+
+    const result = await db.query(
+      `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type,
+              tx_hash, status, created_at, ledger_close_time, fee_breakdown
+       FROM transactions
+       WHERE id = $1 AND (sender_wallet = ANY($2) OR recipient_wallet = ANY($2))`,
+      [req.params.id, publicKeys],
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Payment not found" });
+
+    const tx = result.rows[0];
+    res.json({
+      ...tx,
+      direction: publicKeys.includes(tx.sender_wallet) ? "sent" : "received",
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { send, sendBatch, history, findPath, sendPath, exportCSV, estimateFee, estimateFees, getFeeStats, getFeeRate, findReceivePathHandler, sendStrictReceivePath, getPaymentById };

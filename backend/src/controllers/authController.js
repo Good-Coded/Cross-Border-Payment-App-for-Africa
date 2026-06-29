@@ -21,6 +21,7 @@ const { setCsrfCookie } = require('../middleware/csrf');
 const cache = require('../utils/cache');
 
 const { sendOTP } = require('../services/sms');
+const { recordSession, invalidateOtherSessions } = require('./sessionController');
 const { recordSession } = require('./sessionController');
 
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
@@ -878,6 +879,29 @@ async function getActivity(req, res, next) {
   }
 }
 
+async function changePassword(req, res, next) {
+  try {
+    const { current_password, new_password } = req.body;
+    const userId = req.user.userId;
+
+    const { rows } = await db.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+    if (!rows[0] || !(await bcrypt.compare(current_password, rows[0].password_hash))) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    const newHash = await bcrypt.hash(new_password, 12);
+    await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, userId]);
+
+    // Invalidate all other sessions
+    const currentHash = req.headers.authorization
+      ? require('crypto').createHash('sha256').update(req.headers.authorization.replace('Bearer ', '')).digest('hex')
+      : null;
+    if (currentHash) {
+      await invalidateOtherSessions(userId, currentHash).catch(() => {});
+    }
+
+    audit.log(userId, 'password_change', req.ip, req.headers['user-agent']);
+    res.json({ message: 'Password changed successfully' });
 // Magic-bytes signatures for allowed image types
 const IMAGE_MAGIC = [
   { mime: 'image/jpeg', bytes: [0xff, 0xd8, 0xff] },
@@ -950,5 +974,6 @@ module.exports = {
   disable2FA,
   forgotPassword,
   resetPassword,
+  changePassword,
   validateResetToken,
 };

@@ -21,6 +21,7 @@ const {
   disable2FA,
   forgotPassword,
   resetPassword,
+  changePassword,
   validateResetToken,
 } = require('../controllers/authController');
 const authMiddleware = require('../middleware/auth');
@@ -166,6 +167,16 @@ const avatarUpload = multer({
   },
 });
 
+// Change password — invalidates all other active sessions
+router.patch(
+  '/password',
+  authMiddleware,
+  [
+    body('current_password').notEmpty().withMessage('Current password is required'),
+    body('new_password').isLength({ min: 8 }).withMessage('New password must be at least 8 characters'),
+  ],
+  validate,
+  changePassword
 router.post(
   '/avatar',
   authMiddleware,
