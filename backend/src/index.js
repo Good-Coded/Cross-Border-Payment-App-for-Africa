@@ -41,6 +41,7 @@ const ledgerListener = require('./services/ledgerListener');
 const { Server: SocketIOServer } = require('socket.io');
 const jwt = require('jsonwebtoken');
 const { startScheduler } = require('./scheduler');
+const { setSocketIO } = require('./services/notificationInbox');
 
 const PORT = process.env.PORT || 5000;
 const SHUTDOWN_TIMEOUT_MS = 30_000;
@@ -103,6 +104,7 @@ io.on('connection', async (socket) => {
 
 ledgerListener.setSocketIO(io);
 ledgerListener.initStreams();
+setSocketIO(io);
 
 async function shutdown(signal) {
   logger.info(`${signal} received — shutting down gracefully`);
