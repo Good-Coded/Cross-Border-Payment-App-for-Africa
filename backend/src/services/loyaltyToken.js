@@ -150,7 +150,8 @@ async function redeemPoints({ encryptedSecretKey, walletAddress }) {
  * Returns the point balance as a number.
  */
 async function getBalance({ walletAddress }) {
-  requireContractId();
+  // Return 0 if loyalty contract is not configured (non-fatal)
+  if (!CONTRACT_ID) return 0;
 
   const rpc = getRpc();
   const contract = new StellarSdk.Contract(CONTRACT_ID);

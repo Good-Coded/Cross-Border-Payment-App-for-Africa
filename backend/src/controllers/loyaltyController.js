@@ -28,6 +28,10 @@ async function balance(req, res, next) {
     }
     const { public_key } = walletResult.rows[0];
 
+    if (!process.env.LOYALTY_TOKEN_CONTRACT_ID) {
+      return res.json({ wallet: public_key, points: 0 });
+    }
+
     const points = await getBalance({ walletAddress: public_key });
     res.json({ wallet: public_key, points });
   } catch (err) {
