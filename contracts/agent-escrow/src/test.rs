@@ -460,3 +460,169 @@ fn test_admin_release_emits_admin_override_event() {
     assert_eq!(payload.to_agent, true);
     assert_eq!(payload.amount, amount);
 }
+
+// ── partial_confirm_payout ────────────────────────────────────────────────────
+
+#[test]
+fn test_partial_confirm_payout_single_release() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let fee_bps = 250u32;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+
+    let partial = 400_0000000i128;
+    client.partial_confirm_payout(&agent, &id, &partial);
+
+    let expected_fee = (partial * fee_bps as i128) / 10_000;
+    let expected_net = partial - expected_fee;
+
+    // Agent receives net amount.
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), expected_net);
+    // Platform fee accumulated.
+    assert_eq!(client.get_fees(), expected_fee);
+    // Escrow still pending with updated released_amount.
+    let escrow = client.get_escrow(&id);
+    assert_eq!(escrow.status, EscrowStatus::Pending);
+    assert_eq!(escrow.released_amount, partial);
+}
+
+#[test]
+fn test_partial_confirm_payout_multiple_releases_complete_escrow() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let fee_bps = 200u32;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+
+    let first = 300_0000000i128;
+    let second = 300_0000000i128;
+    let third = 400_0000000i128; // first + second + third == amount
+
+    client.partial_confirm_payout(&agent, &id, &first);
+    client.partial_confirm_payout(&agent, &id, &second);
+    client.partial_confirm_payout(&agent, &id, &third);
+
+    let fee1 = (first * fee_bps as i128) / 10_000;
+    let fee2 = (second * fee_bps as i128) / 10_000;
+    let fee3 = (third * fee_bps as i128) / 10_000;
+    let total_fee = fee1 + fee2 + fee3;
+    let total_net = (first - fee1) + (second - fee2) + (third - fee3);
+
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), total_net);
+    assert_eq!(client.get_fees(), total_fee);
+
+    // After final release escrow must be Completed automatically.
+    let escrow = client.get_escrow(&id);
+    assert_eq!(escrow.status, EscrowStatus::Completed);
+    assert_eq!(escrow.released_amount, amount);
+}
+
+#[test]
+#[should_panic(expected = "Release exceeds remaining balance")]
+fn test_partial_confirm_payout_over_release_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 500_0000000i128;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
+
+    // Try to release more than the escrow amount.
+    client.partial_confirm_payout(&agent, &id, &(amount + 1));
+}
+
+#[test]
+#[should_panic(expected = "Release exceeds remaining balance")]
+fn test_partial_confirm_payout_over_remaining_after_first_release_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
+
+    client.partial_confirm_payout(&agent, &id, &600_0000000);
+    // Remaining is 400; trying to release 401 should panic.
+    client.partial_confirm_payout(&agent, &id, &400_0000001);
+}
+
+#[test]
+#[should_panic(expected = "escrow has expired")]
+fn test_partial_confirm_payout_after_expiry_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, 500_0000000, 250);
+
+    // Advance time past expires_at (48 h window).
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
+
+    client.partial_confirm_payout(&agent, &id, &100_0000000);
+}
+
+#[test]
+#[should_panic(expected = "escrow is not pending")]
+fn test_partial_confirm_payout_on_completed_escrow_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 500_0000000i128;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
+    client.confirm_payout(&agent, &id);
+    client.partial_confirm_payout(&agent, &id, &100_0000000);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: caller is not the escrow agent")]
+fn test_partial_confirm_payout_wrong_agent_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 500_0000000, 250);
+    let impostor = Address::generate(&env);
+    client.partial_confirm_payout(&impostor, &id, &100_0000000);
+}
+
+#[test]
+fn test_partial_confirm_payout_emits_event() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let fee_bps = 250u32;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+
+    let partial = 400_0000000i128;
+    client.partial_confirm_payout(&agent, &id, &partial);
+
+    let event_name: Val = Symbol::new(&env, "PartialPayoutReleased").into_val(&env);
+    let events = env.events().all();
+    let evt = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|t| t == &event_name)
+    });
+    assert!(evt.is_some(), "PartialPayoutReleased event not emitted");
+
+    let (_, _, data) = evt.unwrap();
+    let payload: crate::EvtPartialPayoutReleased = soroban_sdk::from_val(&env, data);
+    assert_eq!(payload.escrow_id, id);
+    assert_eq!(payload.agent, agent);
+
+    let expected_fee = (partial * fee_bps as i128) / 10_000;
+    let expected_net = partial - expected_fee;
+    assert_eq!(payload.released_amount, expected_net);
+    assert_eq!(payload.fee_amount, expected_fee);
+    assert_eq!(payload.remaining_amount, amount - partial);
+}
+
+#[test]
+fn test_partial_confirm_payout_zero_fee() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 800_0000000i128;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 0);
+
+    client.partial_confirm_payout(&agent, &id, &500_0000000);
+
+    // No fee deducted; agent receives full partial amount.
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), 500_0000000);
+    assert_eq!(client.get_fees(), 0);
+    assert_eq!(client.get_escrow(&id).released_amount, 500_0000000);
+}
+
+#[test]
+fn test_partial_confirm_payout_released_amount_tracks_cumulative_gross() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 600_0000000i128;
+    let fee_bps = 100u32;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+
+    client.partial_confirm_payout(&agent, &id, &200_0000000);
+    assert_eq!(client.get_escrow(&id).released_amount, 200_0000000);
+
+    client.partial_confirm_payout(&agent, &id, &200_0000000);
+    assert_eq!(client.get_escrow(&id).released_amount, 400_0000000);
+}
