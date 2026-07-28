@@ -377,7 +377,10 @@ fn test_cancel_paused_schedule() {
 fn test_max_executions_auto_cancels_schedule() {
     let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.create_recurring_payment(&sender, &recipient, &token_id, &100_0000000, &86400, &2);
+    // grace_period_secs=3600, max_missed_executions=3 (defaults)
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &100_0000000, &86400, &2, &3600, &3,
+    );
 
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
@@ -394,7 +397,9 @@ fn test_max_executions_auto_cancels_schedule() {
 fn test_execute_payment_after_max_executions_panics() {
     let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.create_recurring_payment(&sender, &recipient, &token_id, &100_0000000, &86400, &1);
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &100_0000000, &86400, &1, &3600, &3,
+    );
 
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
@@ -409,7 +414,9 @@ fn test_max_executions_zero_means_unlimited() {
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     let amount = 100_0000000i128;
     // max_executions = 0 → unlimited
-    let id = client.create_recurring_payment(&sender, &recipient, &token_id, &amount, &86400, &0);
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &amount, &86400, &0, &3600, &3,
+    );
 
     for _ in 0..5 {
         advance_time(&env, 86400);
@@ -468,4 +475,108 @@ fn test_fee_accumulates_over_multiple_executions() {
         assert_eq!(token_balance(&env, &token_id, &admin), fee_per_execution * i as i128);
         assert_eq!(token_balance(&env, &token_id, &recipient), net_per_execution * i as i128);
     }
+}
+
+// ── Grace period tests ────────────────────────────────────────────────────────
+
+/// Acceptance criterion 1: execution within the grace period succeeds.
+/// Schedule has a 1-hour grace window. Advancing exactly to next_payment_at
+/// + interval + grace_period_secs - 1 should still execute successfully.
+#[test]
+fn test_execute_within_grace_period_succeeds() {
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let amount = 200_0000000i128;
+    let grace = 3_600u64; // 1 hour
+    // Use create_recurring_payment to set an explicit grace period
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &amount, &86400, &0, &grace, &3,
+    );
+
+    // Advance to exactly next_payment_at (due window opens)
+    advance_time(&env, 86400);
+    // Advance a further 1 800 s — halfway through the grace period
+    advance_time(&env, 1_800);
+
+    let before = token_balance(&env, &token_id, &recipient);
+    client.execute_payment(&executor, &id); // must NOT panic
+    let after = token_balance(&env, &token_id, &recipient);
+    assert_eq!(after - before, amount);
+
+    // Consecutive misses must remain zero after a successful execution
+    assert_eq!(client.get_missed_executions(&id), 0);
+    assert_eq!(client.get_recurring_payment(&id).consecutive_misses, 0);
+}
+
+/// Acceptance criterion 2: execution after grace period panics with the
+/// correct message.
+#[test]
+#[should_panic(expected = "Execution window and grace period have both passed")]
+fn test_execute_after_grace_period_panics() {
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let amount = 200_0000000i128;
+    let grace = 3_600u64; // 1 hour
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &amount, &86400, &0, &grace, &3,
+    );
+
+    // Advance past next_payment_at AND the full grace window
+    advance_time(&env, 86400 + grace + 1);
+
+    // Must panic because both the execution window and grace period have passed
+    client.execute_payment(&executor, &id);
+}
+
+/// Acceptance criterion 3: schedule is auto-cancelled after 3 consecutive
+/// missed executions (max_missed_executions = 3).
+#[test]
+fn test_auto_cancel_after_three_consecutive_misses() {
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let amount = 100_0000000i128;
+    let grace = 3_600u64; // 1 hour
+    let max_missed = 3u64;
+    let interval = 86_400u64; // daily
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &amount, &interval, &0, &grace, &max_missed,
+    );
+
+    // Miss 1: advance past first window + grace, call execute_payment to trigger miss recording
+    // Each call panics but also records the miss and advances next_payment_at.
+    // We use std::panic::catch_unwind equivalent — in Soroban test env we rely on
+    // the fact that the schedule IS mutated before the panic; so we call the
+    // panicking functions and just verify state afterwards.
+
+    // Miss 1
+    advance_time(&env, interval + grace + 1);
+    let result1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_payment(&executor, &id);
+    }));
+    assert!(result1.is_err(), "expected panic for miss 1");
+    assert_eq!(client.get_missed_executions(&id), 1);
+    assert_eq!(client.get_recurring_payment(&id).status, ScheduleStatus::Active);
+
+    // Miss 2: the schedule's next_payment_at was advanced by the miss handler;
+    // advance past that new window + grace period again.
+    advance_time(&env, interval + grace + 1);
+    let result2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_payment(&executor, &id);
+    }));
+    assert!(result2.is_err(), "expected panic for miss 2");
+    assert_eq!(client.get_missed_executions(&id), 2);
+    assert_eq!(client.get_recurring_payment(&id).status, ScheduleStatus::Active);
+
+    // Miss 3: triggers auto-cancel
+    advance_time(&env, interval + grace + 1);
+    let result3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_payment(&executor, &id);
+    }));
+    assert!(result3.is_err(), "expected panic for miss 3");
+    assert_eq!(client.get_missed_executions(&id), 3);
+    // After 3 consecutive misses the schedule must be Cancelled
+    assert_eq!(
+        client.get_recurring_payment(&id).status,
+        ScheduleStatus::Cancelled
+    );
 }

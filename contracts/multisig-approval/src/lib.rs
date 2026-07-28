@@ -1,9 +1,11 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
 mod test;
 
+const DEFAULT_PROPOSAL_TTL_SECS: u64 = 604_800; // 7 days
 const EXPIRY_SECONDS: u64 = 86_400; // 24 hours
+const ROTATION_DELAY: u64 = 259_200; // 72 hours
 
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,6 +41,24 @@ pub struct QuorumChangeProposal {
     pub expires_at: u64,
 }
 
+/// Whether a pending rotation adds or removes a signer.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RotationAction {
+    Add,
+    Remove,
+}
+
+/// A time-locked signer-rotation request waiting to become effective.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingRotation {
+    pub action: RotationAction,
+    pub signer: Address,
+    /// Unix timestamp after which `execute_signer_change` may be called.
+    pub effective_at: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -50,7 +70,37 @@ pub enum DataKey {
     QuorumCounter,
     QuorumProposal(u64),
     QuorumVoted(u64, Address),
+    ProposalTtl,
+    PendingRotation,
 }
+
+// ── Signer-rotation event payloads ────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct EvtSignerChangeProposed {
+    pub action: RotationAction,
+    pub signer: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct EvtSignerChanged {
+    pub action: RotationAction,
+    pub signer: Address,
+    pub executed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct EvtSignerChangeCancelled {
+    pub action: RotationAction,
+    pub signer: Address,
+    pub cancelled_at: u64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct MultisigContract;
@@ -69,6 +119,7 @@ impl MultisigContract {
         env.storage().instance().set(&DataKey::Quorum, &quorum);
         env.storage().instance().set(&DataKey::TxCounter, &0u64);
         env.storage().instance().set(&DataKey::QuorumCounter, &0u64);
+        env.storage().instance().set(&DataKey::ProposalTtl, &DEFAULT_PROPOSAL_TTL_SECS);
     }
 
     /// Propose a new transaction. Any approver may propose.
@@ -81,7 +132,8 @@ impl MultisigContract {
         assert!(amount > 0, "amount must be positive");
 
         let id: u64 = env.storage().instance().get(&DataKey::TxCounter).unwrap();
-        let expires_at = env.ledger().timestamp() + EXPIRY_SECONDS;
+        let proposal_ttl: u64 = env.storage().instance().get(&DataKey::ProposalTtl).unwrap_or(DEFAULT_PROPOSAL_TTL_SECS);
+        let expires_at = env.ledger().timestamp() + proposal_ttl;
 
         let proposal = Proposal {
             proposer,
@@ -105,6 +157,11 @@ impl MultisigContract {
 
         let mut proposal = Self::get_pending(&env, tx_id);
         assert!(!env.storage().persistent().has(&DataKey::Voted(tx_id, approver.clone())), "already voted");
+
+        // Check expiry
+        if env.ledger().timestamp() > proposal.expires_at {
+            panic!("Proposal has expired");
+        }
 
         env.storage().persistent().set(&DataKey::Voted(tx_id, approver), &true);
         proposal.approvals += 1;
@@ -142,7 +199,11 @@ impl MultisigContract {
         let mut proposal: Proposal = env.storage().persistent().get(&DataKey::Proposal(tx_id))
             .expect("proposal not found");
         assert!(proposal.status == TxStatus::Pending, "not pending");
-        assert!(env.ledger().timestamp() >= proposal.expires_at, "not yet expired");
+        
+        if env.ledger().timestamp() <= proposal.expires_at {
+            panic!("Proposal has not expired yet");
+        }
+        
         proposal.status = TxStatus::Expired;
         env.storage().persistent().set(&DataKey::Proposal(tx_id), &proposal);
     }
@@ -177,7 +238,8 @@ impl MultisigContract {
         assert!(new_quorum > 0 && new_quorum as usize <= approvers.len(), "invalid quorum");
 
         let id: u64 = env.storage().instance().get(&DataKey::QuorumCounter).unwrap();
-        let expires_at = env.ledger().timestamp() + EXPIRY_SECONDS;
+        let proposal_ttl: u64 = env.storage().instance().get(&DataKey::ProposalTtl).unwrap_or(DEFAULT_PROPOSAL_TTL_SECS);
+        let expires_at = env.ledger().timestamp() + proposal_ttl;
 
         let proposal = QuorumChangeProposal {
             proposer,
@@ -235,6 +297,164 @@ impl MultisigContract {
     pub fn get_quorum_proposal(env: Env, id: u64) -> QuorumChangeProposal {
         env.storage().persistent().get(&DataKey::QuorumProposal(id))
             .expect("quorum proposal not found")
+    }
+
+    /// Update the proposal TTL (time-to-live). Only admin may call this.
+    /// Applies to future proposals only, not retroactively.
+    pub fn update_proposal_ttl(env: Env, admin: Address, new_ttl: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can update proposal TTL");
+        }
+        if new_ttl == 0 {
+            panic!("TTL must be positive");
+        }
+        env.storage().instance().set(&DataKey::ProposalTtl, &new_ttl);
+    }
+
+    /// Clean up an expired proposal. Anyone may call this.
+    /// Removes the proposal from storage to reclaim ledger rent.
+    pub fn cleanup_expired(env: Env, tx_id: u64) {
+        let proposal: Proposal = env.storage().persistent().get(&DataKey::Proposal(tx_id))
+            .expect("proposal not found");
+        
+        if proposal.status != TxStatus::Expired {
+            panic!("Only expired proposals can be cleaned up");
+        }
+        
+        env.storage().persistent().remove(&DataKey::Proposal(tx_id));
+    // --- signer rotation ---
+
+    /// Propose adding or removing a signer. Admin only.
+    ///
+    /// The rotation is time-locked: it cannot be executed until
+    /// `now + 259200` (72 hours). Only one rotation may be pending at a time.
+    /// Emits `SignerChangeProposed`.
+    ///
+    /// # Arguments
+    /// * `action` — `RotationAction::Add` or `RotationAction::Remove`.
+    /// * `signer` — The address to add or remove from the approvers list.
+    pub fn propose_signer_change(env: Env, action: RotationAction, signer: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::PendingRotation) {
+            panic!("Rotation already pending");
+        }
+
+        let effective_at = env.ledger().timestamp() + ROTATION_DELAY;
+        let rotation = PendingRotation {
+            action,
+            signer: signer.clone(),
+            effective_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingRotation, &rotation);
+
+        env.events().publish(
+            (Symbol::new(&env, "SignerChangeProposed"),),
+            EvtSignerChangeProposed { action, signer, effective_at },
+        );
+    }
+
+    /// Execute a pending signer rotation after the time-lock has elapsed.
+    ///
+    /// Anyone may call this once `effective_at` is reached.
+    /// - `Add`: appends the signer to the approvers list (no-op if already present).
+    /// - `Remove`: removes the signer; panics if doing so would make the quorum
+    ///   unreachable.
+    /// Emits `SignerChanged`.
+    pub fn execute_signer_change(env: Env) {
+        let rotation: PendingRotation = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingRotation)
+            .expect("no pending rotation");
+
+        if env.ledger().timestamp() < rotation.effective_at {
+            panic!("Time-lock has not elapsed");
+        }
+
+        let mut approvers: Vec<Address> =
+            env.storage().instance().get(&DataKey::Approvers).unwrap();
+
+        match rotation.action {
+            RotationAction::Add => {
+                if !approvers.contains(&rotation.signer) {
+                    approvers.push_back(rotation.signer.clone());
+                }
+            }
+            RotationAction::Remove => {
+                let quorum: u32 = env.storage().instance().get(&DataKey::Quorum).unwrap();
+                // After removal the list would have approvers.len() - 1 members.
+                // If that is less than quorum the threshold becomes unreachable.
+                if approvers.len() as u32 <= quorum {
+                    panic!("Cannot remove: threshold would be unreachable");
+                }
+                // Rebuild the approvers list without the target signer.
+                let mut new_approvers: Vec<Address> = Vec::new(&env);
+                for a in approvers.iter() {
+                    if a != rotation.signer {
+                        new_approvers.push_back(a);
+                    }
+                }
+                approvers = new_approvers;
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Approvers, &approvers);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingRotation);
+
+        env.events().publish(
+            (Symbol::new(&env, "SignerChanged"),),
+            EvtSignerChanged {
+                action: rotation.action,
+                signer: rotation.signer,
+                executed_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Cancel the pending signer rotation before its time-lock elapses. Admin only.
+    ///
+    /// Emits `SignerChangeCancelled`.
+    pub fn cancel_signer_change(env: Env) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+
+        let rotation: PendingRotation = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingRotation)
+            .expect("no pending rotation");
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingRotation);
+
+        env.events().publish(
+            (Symbol::new(&env, "SignerChangeCancelled"),),
+            EvtSignerChangeCancelled {
+                action: rotation.action,
+                signer: rotation.signer,
+                cancelled_at: env.ledger().timestamp(),
+            },
+        );
     }
 
     // --- helpers ---
