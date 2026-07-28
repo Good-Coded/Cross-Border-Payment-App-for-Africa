@@ -112,6 +112,22 @@ pub struct ScheduleResumed {
     pub id: u64,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct AmountUpdated {
+    pub schedule_id: u64,
+    pub old_amount: i128,
+    pub new_amount: i128,
+    pub updated_by: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct RecipientUpdated {
+    pub schedule_id: u64,
+    pub old_recipient: Address,
+    pub new_recipient: Address,
+    pub updated_by: Address,
 /// Emitted when an execution window (plus grace period) passes without a
 /// successful payment. Also emitted when the caller detects a missed window
 /// by calling `execute_payment` after the grace period has expired.
@@ -524,6 +540,78 @@ impl RecurringPaymentsContract {
         Self::get_recurring_payment(env, schedule_id)
     }
 
+    /// Update the payment amount for a recurring schedule. Only the sender may update.
+    /// The new amount takes effect from the next scheduled execution.
+    pub fn update_amount(env: Env, sender: Address, schedule_id: u64, new_amount: i128) {
+        sender.require_auth();
+
+        if new_amount <= 0 {
+            panic!("Amount must be positive");
+        }
+
+        let mut schedule: RecurringSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("schedule not found");
+
+        if schedule.sender != sender {
+            panic!("only the sender can update amount");
+        }
+        if schedule.status == ScheduleStatus::Cancelled {
+            panic!("cannot update cancelled schedule");
+        }
+
+        let old_amount = schedule.amount;
+        schedule.amount = new_amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Schedule(schedule_id), &schedule);
+
+        env.events().publish(
+            (Symbol::new(&env, "AmountUpdated"),),
+            AmountUpdated {
+                schedule_id,
+                old_amount,
+                new_amount,
+                updated_by: sender,
+            },
+        );
+    }
+
+    /// Update the recipient address for a recurring schedule. Only the sender may update.
+    /// The new recipient takes effect from the next scheduled execution.
+    pub fn update_recipient(env: Env, sender: Address, schedule_id: u64, new_recipient: Address) {
+        sender.require_auth();
+
+        let mut schedule: RecurringSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("schedule not found");
+
+        if schedule.sender != sender {
+            panic!("only the sender can update recipient");
+        }
+        if schedule.status == ScheduleStatus::Cancelled {
+            panic!("cannot update cancelled schedule");
+        }
+
+        let old_recipient = schedule.recipient.clone();
+        schedule.recipient = new_recipient.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Schedule(schedule_id), &schedule);
+
+        env.events().publish(
+            (Symbol::new(&env, "RecipientUpdated"),),
+            RecipientUpdated {
+                schedule_id,
+                old_recipient,
+                new_recipient,
+                updated_by: sender,
+            },
+        );
     /// Return the current consecutive missed-execution count for a schedule.
     pub fn get_missed_executions(env: Env, schedule_id: u64) -> u64 {
         env.storage()

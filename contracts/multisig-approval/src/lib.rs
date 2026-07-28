@@ -3,6 +3,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Sy
 
 mod test;
 
+const DEFAULT_PROPOSAL_TTL_SECS: u64 = 604_800; // 7 days
 const EXPIRY_SECONDS: u64 = 86_400; // 24 hours
 const ROTATION_DELAY: u64 = 259_200; // 72 hours
 
@@ -69,6 +70,7 @@ pub enum DataKey {
     QuorumCounter,
     QuorumProposal(u64),
     QuorumVoted(u64, Address),
+    ProposalTtl,
     PendingRotation,
 }
 
@@ -117,6 +119,7 @@ impl MultisigContract {
         env.storage().instance().set(&DataKey::Quorum, &quorum);
         env.storage().instance().set(&DataKey::TxCounter, &0u64);
         env.storage().instance().set(&DataKey::QuorumCounter, &0u64);
+        env.storage().instance().set(&DataKey::ProposalTtl, &DEFAULT_PROPOSAL_TTL_SECS);
     }
 
     /// Propose a new transaction. Any approver may propose.
@@ -129,7 +132,8 @@ impl MultisigContract {
         assert!(amount > 0, "amount must be positive");
 
         let id: u64 = env.storage().instance().get(&DataKey::TxCounter).unwrap();
-        let expires_at = env.ledger().timestamp() + EXPIRY_SECONDS;
+        let proposal_ttl: u64 = env.storage().instance().get(&DataKey::ProposalTtl).unwrap_or(DEFAULT_PROPOSAL_TTL_SECS);
+        let expires_at = env.ledger().timestamp() + proposal_ttl;
 
         let proposal = Proposal {
             proposer,
@@ -153,6 +157,11 @@ impl MultisigContract {
 
         let mut proposal = Self::get_pending(&env, tx_id);
         assert!(!env.storage().persistent().has(&DataKey::Voted(tx_id, approver.clone())), "already voted");
+
+        // Check expiry
+        if env.ledger().timestamp() > proposal.expires_at {
+            panic!("Proposal has expired");
+        }
 
         env.storage().persistent().set(&DataKey::Voted(tx_id, approver), &true);
         proposal.approvals += 1;
@@ -190,7 +199,11 @@ impl MultisigContract {
         let mut proposal: Proposal = env.storage().persistent().get(&DataKey::Proposal(tx_id))
             .expect("proposal not found");
         assert!(proposal.status == TxStatus::Pending, "not pending");
-        assert!(env.ledger().timestamp() >= proposal.expires_at, "not yet expired");
+        
+        if env.ledger().timestamp() <= proposal.expires_at {
+            panic!("Proposal has not expired yet");
+        }
+        
         proposal.status = TxStatus::Expired;
         env.storage().persistent().set(&DataKey::Proposal(tx_id), &proposal);
     }
@@ -225,7 +238,8 @@ impl MultisigContract {
         assert!(new_quorum > 0 && new_quorum as usize <= approvers.len(), "invalid quorum");
 
         let id: u64 = env.storage().instance().get(&DataKey::QuorumCounter).unwrap();
-        let expires_at = env.ledger().timestamp() + EXPIRY_SECONDS;
+        let proposal_ttl: u64 = env.storage().instance().get(&DataKey::ProposalTtl).unwrap_or(DEFAULT_PROPOSAL_TTL_SECS);
+        let expires_at = env.ledger().timestamp() + proposal_ttl;
 
         let proposal = QuorumChangeProposal {
             proposer,
@@ -285,6 +299,32 @@ impl MultisigContract {
             .expect("quorum proposal not found")
     }
 
+    /// Update the proposal TTL (time-to-live). Only admin may call this.
+    /// Applies to future proposals only, not retroactively.
+    pub fn update_proposal_ttl(env: Env, admin: Address, new_ttl: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can update proposal TTL");
+        }
+        if new_ttl == 0 {
+            panic!("TTL must be positive");
+        }
+        env.storage().instance().set(&DataKey::ProposalTtl, &new_ttl);
+    }
+
+    /// Clean up an expired proposal. Anyone may call this.
+    /// Removes the proposal from storage to reclaim ledger rent.
+    pub fn cleanup_expired(env: Env, tx_id: u64) {
+        let proposal: Proposal = env.storage().persistent().get(&DataKey::Proposal(tx_id))
+            .expect("proposal not found");
+        
+        if proposal.status != TxStatus::Expired {
+            panic!("Only expired proposals can be cleaned up");
+        }
+        
+        env.storage().persistent().remove(&DataKey::Proposal(tx_id));
     // --- signer rotation ---
 
     /// Propose adding or removing a signer. Admin only.

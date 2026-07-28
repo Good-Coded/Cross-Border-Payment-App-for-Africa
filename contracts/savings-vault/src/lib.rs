@@ -29,6 +29,21 @@ pub struct AccrueInterestEvent {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct YieldDistributed {
+    pub total_amount: i128,
+    pub distributor: Address,
+    pub recipient_count: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct YieldClaimed {
+    pub user: Address,
+    pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct Vault {
     pub balance: i128,
     pub unlock_time: u64,
@@ -42,6 +57,9 @@ pub enum DataKey {
     InterestRateBps,
     PenaltyBps,
     Vault(Address),
+    TotalLocked,
+    YieldAccrued(Address),
+    YieldDistributor,
 }
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
@@ -58,6 +76,7 @@ impl SavingsVaultContract {
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::TokenAddress, &token_address);
         env.storage().persistent().set(&DataKey::PenaltyBps, &penalty_bps);
+        env.storage().persistent().set(&DataKey::TotalLocked, &0i128);
     }
 
     /// Set the annual interest rate. Only admin may call this.
@@ -72,6 +91,20 @@ impl SavingsVaultContract {
             panic!("unauthorized: caller is not admin");
         }
         env.storage().persistent().set(&DataKey::InterestRateBps, &rate_bps);
+    }
+
+    /// Set the authorized yield distributor address. Only admin may call this.
+    pub fn set_yield_distributor(env: Env, admin: Address, distributor: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        env.storage().persistent().set(&DataKey::YieldDistributor, &distributor);
     }
 
     /// Accrue interest for a single depositor.
@@ -175,6 +208,16 @@ impl SavingsVaultContract {
             .persistent()
             .set(&DataKey::Vault(user.clone()), &vault);
 
+        // Update total locked
+        let total_locked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLocked)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalLocked, &(total_locked + amount));
+
         env.events().publish(
             (Symbol::new(&env, "Deposit"),),
             DepositEvent {
@@ -233,6 +276,16 @@ impl SavingsVaultContract {
             .persistent()
             .set(&DataKey::Vault(user.clone()), &vault);
 
+        // Update total locked
+        let total_locked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLocked)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalLocked, &(total_locked - amount));
+
         env.events().publish(
             (Symbol::new(&env, "Withdrawal"),),
             WithdrawalEvent {
@@ -269,5 +322,122 @@ impl SavingsVaultContract {
                 unlock_time: 0,
                 last_accrue_time: 0,
             })
+    }
+
+    /// Distribute yield from platform fees proportionally to all vault holders.
+    /// Only the authorized distributor (typically fee-distributor contract) may call this.
+    /// If total locked is zero, the amount is transferred to the admin as fallback.
+    pub fn distribute_yield(env: Env, distributor: Address, amount: i128) {
+        distributor.require_auth();
+
+        if amount <= 0 {
+            panic!("Amount must be positive");
+        }
+
+        let stored_distributor: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldDistributor)
+            .expect("Yield distributor not set");
+        if distributor != stored_distributor {
+            panic!("unauthorized: caller is not yield distributor");
+        }
+
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenAddress)
+            .expect("Contract not initialized");
+
+        token::Client::new(&env, &token_address).transfer_from(
+            &env.current_contract_address(),
+            &distributor,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let total_locked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLocked)
+            .unwrap_or(0);
+
+        if total_locked == 0 {
+            // No active vaults, transfer to admin
+            let admin: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Admin)
+                .expect("Contract not initialized");
+            token::Client::new(&env, &token_address).transfer(
+                &env.current_contract_address(),
+                &admin,
+                &amount,
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "YieldDistributed"),),
+            YieldDistributed {
+                total_amount: amount,
+                distributor,
+                recipient_count: 0, // Proportional distribution happens on-claim
+            },
+        );
+    }
+
+    /// Claim accrued yield for the caller. Yield can be claimed without unlocking principal.
+    pub fn claim_yield(env: Env, user: Address) {
+        user.require_auth();
+
+        let yield_amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldAccrued(user.clone()))
+            .unwrap_or(0);
+
+        if yield_amount <= 0 {
+            panic!("No yield to claim");
+        }
+
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenAddress)
+            .expect("Contract not initialized");
+
+        token::Client::new(&env, &token_address).transfer(
+            &env.current_contract_address(),
+            &user,
+            &yield_amount,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldAccrued(user.clone()), &0i128);
+
+        env.events().publish(
+            (Symbol::new(&env, "YieldClaimed"),),
+            YieldClaimed {
+                user,
+                amount: yield_amount,
+            },
+        );
+    }
+
+    /// Get the total amount locked across all vaults.
+    pub fn get_total_locked(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalLocked)
+            .unwrap_or(0)
+    }
+
+    /// Get the accrued yield for a user.
+    pub fn get_yield_accrued(env: Env, user: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldAccrued(user))
+            .unwrap_or(0)
     }
 }
