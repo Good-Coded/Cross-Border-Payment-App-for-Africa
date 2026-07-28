@@ -25,6 +25,8 @@ pub enum DataKey {
     Fees,
     CancelWindow,
     Escrow(u64),
+    InsuranceFund,
+    InsuranceContributionBps,
 }
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -109,6 +111,17 @@ pub struct AdminOverride {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct InsuranceFundContribution {
+    pub escrow_id: u64,
+    pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct InsurancePayout {
+    pub escrow_id: u64,
+    pub recipient: Address,
+    pub amount: i128,
 pub struct EvtPartialPayoutReleased {
     pub escrow_id: u64,
     pub agent: Address,
@@ -141,6 +154,8 @@ impl AgentEscrowContract {
         env.storage().persistent().set(&DataKey::UsdcAddress, &usdc_address);
         env.storage().persistent().set(&DataKey::CancelWindow, &cancel_window_seconds);
         env.storage().persistent().set(&DataKey::Counter, &0u64);
+        env.storage().persistent().set(&DataKey::InsuranceFund, &0i128);
+        env.storage().persistent().set(&DataKey::InsuranceContributionBps, &500u32); // 5% default
     }
 
     /// Lock USDC in escrow pending agent payout confirmation.
@@ -226,6 +241,7 @@ impl AgentEscrowContract {
     /// Agent confirms off-chain fiat delivery, releasing USDC from escrow.
     ///
     /// Transfers `(amount - fee)` to the agent and accumulates the fee.
+    /// A portion of the fee is contributed to the insurance fund.
     /// Only the designated agent may call this function.
     ///
     /// # Arguments
@@ -262,6 +278,26 @@ impl AgentEscrowContract {
             &agent_amount,
         );
 
+        // Calculate insurance contribution
+        let contribution_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceContributionBps)
+            .unwrap_or(500);
+        let insurance_contribution = (fee_amount * contribution_bps as i128) / 10_000;
+        let fee_to_distribute = fee_amount - insurance_contribution;
+
+        // Add to insurance fund
+        let insurance_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceFund, &(insurance_balance + insurance_contribution));
+
+        // Add remaining fee to distributable fees
         let fees: i128 = env
             .storage()
             .persistent()
@@ -269,7 +305,7 @@ impl AgentEscrowContract {
             .unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&DataKey::Fees, &(fees + fee_amount));
+            .set(&DataKey::Fees, &(fees + fee_to_distribute));
 
         escrow.status = EscrowStatus::Completed;
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
@@ -366,6 +402,14 @@ impl AgentEscrowContract {
                 released_amount: net_to_agent,
                 remaining_amount: remaining_after,
                 fee_amount,
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "InsuranceFundContribution"),),
+            InsuranceFundContribution {
+                escrow_id,
+                amount: insurance_contribution,
             },
         );
     }
@@ -579,5 +623,96 @@ impl AgentEscrowContract {
                 amount: escrow.amount,
             },
         );
+    }
+
+    /// Return the current insurance fund balance.
+    pub fn get_insurance_balance(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(0)
+    }
+
+    /// Admin-only function to payout from the insurance fund to a defrauded recipient.
+    ///
+    /// # Arguments
+    /// * `escrow_id` — ID of the escrow that was fraudulent.
+    /// * `recipient` — Address to receive the insurance payout.
+    pub fn insurance_payout(env: Env, escrow_id: u64, recipient: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap();
+        admin.require_auth();
+
+        let escrow: AgentEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("escrow not found");
+
+        let insurance_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(0);
+
+        // Pay up to the original escrow amount or available balance
+        let payout_amount = if escrow.amount <= insurance_balance {
+            escrow.amount
+        } else {
+            insurance_balance
+        };
+
+        if payout_amount == 0 {
+            panic!("insufficient insurance fund balance");
+        }
+
+        let usdc: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsdcAddress)
+            .unwrap();
+
+        token::Client::new(&env, &usdc).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &payout_amount,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceFund, &(insurance_balance - payout_amount));
+
+        env.events().publish(
+            (Symbol::new(&env, "InsurancePayout"),),
+            InsurancePayout {
+                escrow_id,
+                recipient,
+                amount: payout_amount,
+            },
+        );
+    }
+
+    /// Update the insurance contribution rate. Admin-only.
+    ///
+    /// # Arguments
+    /// * `new_bps` — New contribution rate in basis points (max 1000 = 10%).
+    pub fn update_insurance_contribution_bps(env: Env, new_bps: u32) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap();
+        admin.require_auth();
+
+        if new_bps > 1000 {
+            panic!("contribution rate cannot exceed 1000 bps (10%)");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceContributionBps, &new_bps);
     }
 }

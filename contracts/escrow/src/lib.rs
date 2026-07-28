@@ -52,6 +52,24 @@ pub struct EscrowExpired {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct EscrowBatchCreated {
+    pub batch_size: u32,
+    pub first_escrow_id: u64,
+    pub last_escrow_id: u64,
+    pub total_amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowParams {
+    pub recipient: Address,
+    pub agent: Address,
+    pub amount: i128,
+    pub release_fee_bps: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct DeliveryConfirmed {
     pub escrow_id: u64,
     pub agent: Address,
@@ -809,6 +827,128 @@ impl EscrowContract {
         (admin, usdc_address)
     }
 
+    /// Batch create multiple escrows in a single transaction.
+    ///
+    /// # Arguments
+    /// * `sender`  — Payer; must authorise this call.
+    /// * `escrows` — Vector of escrow parameters (max 20).
+    ///
+    /// # Returns
+    /// First escrow ID created.
+    ///
+    /// # Panics
+    /// * If batch size exceeds 20
+    /// * If any escrow has invalid parameters
+    /// * If sender doesn't have sufficient USDC for total amount
+    pub fn batch_create_escrow(
+        env: Env,
+        sender: Address,
+        escrows: soroban_sdk::Vec<EscrowParams>,
+    ) -> u64 {
+        sender.require_auth();
+
+        let batch_size = escrows.len();
+        if batch_size > 20 {
+            panic!("Batch size exceeds maximum of 20");
+        }
+        if batch_size == 0 {
+            panic!("Batch cannot be empty");
+        }
+
+        // Validate all escrows before creating any
+        let mut total_amount: i128 = 0;
+        for escrow_params in escrows.iter() {
+            if escrow_params.amount < MIN_ESCROW_AMOUNT {
+                panic!("Amount below minimum (100 stroops)");
+            }
+            if escrow_params.release_fee_bps == 10000 {
+                panic!("Fee cannot be 100%");
+            }
+            if escrow_params.release_fee_bps > MAX_FEE_BPS {
+                panic!("Fee exceeds maximum of 5000 bps (50%)");
+            }
+            if sender == escrow_params.recipient
+                || sender == escrow_params.agent
+                || escrow_params.recipient == escrow_params.agent
+            {
+                panic!("Sender, recipient, and agent must be distinct addresses");
+            }
+            total_amount += escrow_params.amount;
+        }
+
+        // Transfer total USDC once
+        let usdc_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsdcAddress)
+            .expect("Contract not initialized");
+
+        token::Client::new(&env, &usdc_address).transfer(
+            &sender,
+            &env.current_contract_address(),
+            &total_amount,
+        );
+
+        // Create all escrows
+        let mut current_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowCounter)
+            .unwrap_or(0);
+
+        let first_id = current_id + 1;
+        let now = env.ledger().timestamp();
+
+        for escrow_params in escrows.iter() {
+            let next_id = current_id.checked_add(1).expect("Escrow counter overflow");
+            current_id = next_id;
+
+            let escrow = Escrow {
+                id: next_id,
+                sender: sender.clone(),
+                recipient: escrow_params.recipient.clone(),
+                agent: escrow_params.agent.clone(),
+                amount: escrow_params.amount,
+                release_fee_bps: escrow_params.release_fee_bps,
+                status: EscrowStatus::Pending,
+                payout_confirmed: false,
+                created_at: now,
+                updated_at: now,
+                expires_at: now + DEFAULT_EXPIRY_SECS,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(next_id), &escrow);
+
+            env.events().publish(
+                (Symbol::new(&env, "EscrowCreated"),),
+                EscrowCreated {
+                    escrow_id: next_id,
+                    sender: sender.clone(),
+                    recipient: escrow_params.recipient.clone(),
+                    agent: escrow_params.agent.clone(),
+                    amount: escrow_params.amount,
+                    release_fee_bps: escrow_params.release_fee_bps,
+                },
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowCounter, &current_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "EscrowBatchCreated"),),
+            EscrowBatchCreated {
+                batch_size: batch_size as u32,
+                first_escrow_id: first_id,
+                last_escrow_id: current_id,
+                total_amount,
+            },
+        );
+
+        first_id
     /// Set the KYC contract address. Only admin may call this.
     /// Pass a zero address (all bytes 0) to disable KYC checking.
     pub fn set_kyc_contract(env: Env, admin: Address, kyc_contract: Address) {
