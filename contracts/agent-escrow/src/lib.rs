@@ -57,37 +57,47 @@ pub struct AgentEscrow {
     pub created_at: u64,
     /// Unix timestamp after which the sender may cancel (created_at + 48 h).
     pub expires_at: u64,
+    /// Cumulative amount already released via partial_confirm_payout (stroops).
+    pub released_amount: i128,
 }
 
 // ── Event payloads ────────────────────────────────────────────────────────────
 
+/// Emitted by `create_escrow`. Topics: ("AgentEscrow", "EscrowCreated").
 #[derive(Clone)]
 #[contracttype]
-pub struct EvtCreated {
+pub struct EvtEscrowCreated {
     pub escrow_id: u64,
     pub sender: Address,
     pub recipient: Address,
     pub agent: Address,
     pub amount: i128,
-    pub fee_bps: u32,
     pub expires_at: u64,
 }
 
+/// Emitted by `confirm_payout` and `admin_release` (to_agent=true).
+/// Topics: ("AgentEscrow", "EscrowConfirmed").
 #[derive(Clone)]
 #[contracttype]
-pub struct EvtCompleted {
+pub struct EvtEscrowConfirmed {
     pub escrow_id: u64,
+    pub agent: Address,
     pub agent_amount: i128,
     pub fee_amount: i128,
 }
 
+/// Emitted by `cancel_escrow` and `admin_release` (to_agent=false).
+/// Topics: ("AgentEscrow", "EscrowCancelled").
 #[derive(Clone)]
 #[contracttype]
-pub struct EvtCancelled {
+pub struct EvtEscrowCancelled {
     pub escrow_id: u64,
+    pub sender: Address,
     pub refund_amount: i128,
 }
 
+/// Emitted by `admin_release` in addition to the outcome event.
+/// Topics: ("AgentEscrow", "AdminOverride").
 #[derive(Clone)]
 #[contracttype]
 pub struct AdminOverride {
@@ -95,6 +105,19 @@ pub struct AdminOverride {
     pub admin: Address,
     pub to_agent: bool,
     pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EvtPartialPayoutReleased {
+    pub escrow_id: u64,
+    pub agent: Address,
+    /// Amount released in this call (after pro-rata fee deduction), in stroops.
+    pub released_amount: i128,
+    /// Gross escrow amount not yet released (before fee), in stroops.
+    pub remaining_amount: i128,
+    /// Platform fee deducted from this partial release, in stroops.
+    pub fee_amount: i128,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -188,12 +211,13 @@ impl AgentEscrowContract {
             status: EscrowStatus::Pending,
             created_at: now,
             expires_at,
+            released_amount: 0,
         };
         env.storage().persistent().set(&DataKey::Escrow(id), &escrow);
 
         env.events().publish(
-            (Symbol::new(&env, "EscrowCreated"),),
-            EvtCreated { escrow_id: id, sender, recipient, agent, amount, fee_bps, expires_at },
+            (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowCreated")),
+            EvtEscrowCreated { escrow_id: id, sender, recipient, agent, amount, expires_at },
         );
 
         id
@@ -251,8 +275,98 @@ impl AgentEscrowContract {
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
 
         env.events().publish(
-            (Symbol::new(&env, "PayoutConfirmed"),),
-            EvtCompleted { escrow_id, agent_amount, fee_amount },
+            (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowConfirmed")),
+            EvtEscrowConfirmed { escrow_id, agent, agent_amount, fee_amount },
+        );
+    }
+
+    /// Release a portion of the escrowed USDC to the agent.
+    ///
+    /// The agent delivers cash in installments off-chain and calls this
+    /// function for each installment. The contract deducts a pro-rata
+    /// platform fee from each release. When the cumulative `released_amount`
+    /// equals the original `amount`, the escrow is automatically marked
+    /// `Completed`.
+    ///
+    /// Emits a `PartialPayoutReleased` event on every call.
+    ///
+    /// # Arguments
+    /// * `agent`     — Must match the agent recorded in the escrow.
+    /// * `escrow_id` — ID returned by `create_escrow`.
+    /// * `amount`    — Gross amount to release in this call (stroops, > 0).
+    ///                 Must not exceed `original_amount - released_amount`.
+    pub fn partial_confirm_payout(env: Env, agent: Address, escrow_id: u64, amount: i128) {
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        agent.require_auth();
+
+        let mut escrow: AgentEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("escrow not found");
+
+        if agent != escrow.agent {
+            panic!("unauthorized: caller is not the escrow agent");
+        }
+        if escrow.status != EscrowStatus::Pending {
+            panic!("escrow is not pending");
+        }
+        if env.ledger().timestamp() >= escrow.expires_at {
+            panic!("escrow has expired");
+        }
+
+        let remaining_gross = escrow.amount - escrow.released_amount;
+        if amount > remaining_gross {
+            panic!("Release exceeds remaining balance");
+        }
+
+        // Pro-rata fee: same fee_bps applied to this partial amount.
+        let fee_amount = (amount * escrow.fee_bps as i128) / 10_000;
+        let net_to_agent = amount - fee_amount;
+
+        let usdc: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsdcAddress)
+            .unwrap();
+
+        token::Client::new(&env, &usdc).transfer(
+            &env.current_contract_address(),
+            &escrow.agent,
+            &net_to_agent,
+        );
+
+        // Accumulate platform fee.
+        let fees: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Fees)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Fees, &(fees + fee_amount));
+
+        // Update released_amount and auto-complete when fully settled.
+        escrow.released_amount += amount;
+        if escrow.released_amount == escrow.amount {
+            escrow.status = EscrowStatus::Completed;
+        }
+
+        let remaining_after = escrow.amount - escrow.released_amount;
+        env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "PartialPayoutReleased"),),
+            EvtPartialPayoutReleased {
+                escrow_id,
+                agent: escrow.agent,
+                released_amount: net_to_agent,
+                remaining_amount: remaining_after,
+                fee_amount,
+            },
         );
     }
 
@@ -299,8 +413,8 @@ impl AgentEscrowContract {
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
 
         env.events().publish(
-            (Symbol::new(&env, "EscrowCancelled"),),
-            EvtCancelled { escrow_id, refund_amount: escrow.amount },
+            (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowCancelled")),
+            EvtEscrowCancelled { escrow_id, sender: escrow.sender.clone(), refund_amount: escrow.amount },
         );
     }
 
@@ -428,8 +542,13 @@ impl AgentEscrowContract {
                 .set(&DataKey::Fees, &(fees + fee_amount));
 
             env.events().publish(
-                (Symbol::new(&env, "PayoutConfirmed"),),
-                EvtCompleted { escrow_id, agent_amount: net_amount, fee_amount },
+                (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowConfirmed")),
+                EvtEscrowConfirmed {
+                    escrow_id,
+                    agent: escrow.agent.clone(),
+                    agent_amount: net_amount,
+                    fee_amount,
+                },
             );
         } else {
             token::Client::new(&env, &usdc).transfer(
@@ -440,15 +559,19 @@ impl AgentEscrowContract {
             escrow.status = EscrowStatus::Cancelled;
 
             env.events().publish(
-                (Symbol::new(&env, "EscrowCancelled"),),
-                EvtCancelled { escrow_id, refund_amount: escrow.amount },
+                (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowCancelled")),
+                EvtEscrowCancelled {
+                    escrow_id,
+                    sender: escrow.sender.clone(),
+                    refund_amount: escrow.amount,
+                },
             );
         }
 
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
 
         env.events().publish(
-            (Symbol::new(&env, "AdminOverride"),),
+            (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "AdminOverride")),
             AdminOverride {
                 escrow_id,
                 admin,
