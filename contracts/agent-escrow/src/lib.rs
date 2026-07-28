@@ -61,33 +61,41 @@ pub struct AgentEscrow {
 
 // ── Event payloads ────────────────────────────────────────────────────────────
 
+/// Emitted by `create_escrow`. Topics: ("AgentEscrow", "EscrowCreated").
 #[derive(Clone)]
 #[contracttype]
-pub struct EvtCreated {
+pub struct EvtEscrowCreated {
     pub escrow_id: u64,
     pub sender: Address,
     pub recipient: Address,
     pub agent: Address,
     pub amount: i128,
-    pub fee_bps: u32,
     pub expires_at: u64,
 }
 
+/// Emitted by `confirm_payout` and `admin_release` (to_agent=true).
+/// Topics: ("AgentEscrow", "EscrowConfirmed").
 #[derive(Clone)]
 #[contracttype]
-pub struct EvtCompleted {
+pub struct EvtEscrowConfirmed {
     pub escrow_id: u64,
+    pub agent: Address,
     pub agent_amount: i128,
     pub fee_amount: i128,
 }
 
+/// Emitted by `cancel_escrow` and `admin_release` (to_agent=false).
+/// Topics: ("AgentEscrow", "EscrowCancelled").
 #[derive(Clone)]
 #[contracttype]
-pub struct EvtCancelled {
+pub struct EvtEscrowCancelled {
     pub escrow_id: u64,
+    pub sender: Address,
     pub refund_amount: i128,
 }
 
+/// Emitted by `admin_release` in addition to the outcome event.
+/// Topics: ("AgentEscrow", "AdminOverride").
 #[derive(Clone)]
 #[contracttype]
 pub struct AdminOverride {
@@ -192,8 +200,8 @@ impl AgentEscrowContract {
         env.storage().persistent().set(&DataKey::Escrow(id), &escrow);
 
         env.events().publish(
-            (Symbol::new(&env, "EscrowCreated"),),
-            EvtCreated { escrow_id: id, sender, recipient, agent, amount, fee_bps, expires_at },
+            (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowCreated")),
+            EvtEscrowCreated { escrow_id: id, sender, recipient, agent, amount, expires_at },
         );
 
         id
@@ -251,8 +259,8 @@ impl AgentEscrowContract {
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
 
         env.events().publish(
-            (Symbol::new(&env, "PayoutConfirmed"),),
-            EvtCompleted { escrow_id, agent_amount, fee_amount },
+            (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowConfirmed")),
+            EvtEscrowConfirmed { escrow_id, agent, agent_amount, fee_amount },
         );
     }
 
@@ -299,8 +307,8 @@ impl AgentEscrowContract {
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
 
         env.events().publish(
-            (Symbol::new(&env, "EscrowCancelled"),),
-            EvtCancelled { escrow_id, refund_amount: escrow.amount },
+            (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowCancelled")),
+            EvtEscrowCancelled { escrow_id, sender: escrow.sender.clone(), refund_amount: escrow.amount },
         );
     }
 
@@ -428,8 +436,13 @@ impl AgentEscrowContract {
                 .set(&DataKey::Fees, &(fees + fee_amount));
 
             env.events().publish(
-                (Symbol::new(&env, "PayoutConfirmed"),),
-                EvtCompleted { escrow_id, agent_amount: net_amount, fee_amount },
+                (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowConfirmed")),
+                EvtEscrowConfirmed {
+                    escrow_id,
+                    agent: escrow.agent.clone(),
+                    agent_amount: net_amount,
+                    fee_amount,
+                },
             );
         } else {
             token::Client::new(&env, &usdc).transfer(
@@ -440,15 +453,19 @@ impl AgentEscrowContract {
             escrow.status = EscrowStatus::Cancelled;
 
             env.events().publish(
-                (Symbol::new(&env, "EscrowCancelled"),),
-                EvtCancelled { escrow_id, refund_amount: escrow.amount },
+                (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "EscrowCancelled")),
+                EvtEscrowCancelled {
+                    escrow_id,
+                    sender: escrow.sender.clone(),
+                    refund_amount: escrow.amount,
+                },
             );
         }
 
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
 
         env.events().publish(
-            (Symbol::new(&env, "AdminOverride"),),
+            (Symbol::new(&env, "AgentEscrow"), Symbol::new(&env, "AdminOverride")),
             AdminOverride {
                 escrow_id,
                 admin,

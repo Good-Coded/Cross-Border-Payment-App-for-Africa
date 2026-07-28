@@ -21,7 +21,7 @@
 //! `transfer`, `transfer_from`.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, String,
+    contract, contractimpl, contracttype, symbol_short, Address, Env, String,
 };
 
 #[contracttype]
@@ -142,6 +142,13 @@ impl LoyaltyTokenContract {
     /// caller until `expires_at` (inclusive, Unix ledger timestamp).
     ///
     /// Set `amount` to 0 to revoke an existing allowance.
+    ///
+    /// # Race-condition guard
+    /// To prevent the ERC-20 double-spend race condition, this function panics
+    /// if `amount > 0` and a non-zero allowance already exists.  Callers must
+    /// first call `approve(…, 0, …)` to reset the allowance before setting a
+    /// new non-zero value.  Alternatively, use [`increase_allowance`] /
+    /// [`decrease_allowance`] which are inherently race-condition free.
     pub fn approve(env: Env, owner: Address, spender: Address, amount: i128, expires_at: u64) {
         if amount < 0 {
             panic!("amount must be non-negative");
@@ -149,10 +156,114 @@ impl LoyaltyTokenContract {
         if expires_at < env.ledger().timestamp() {
             panic!("expires_at must be in the future");
         }
+        // Race-condition guard: prevent double-spend by rejecting a non-zero
+        // approval while a non-zero allowance is still active.
+        if amount > 0 {
+            let current = Self::allowance(env.clone(), owner.clone(), spender.clone());
+            if current > 0 {
+                panic!("Reset to zero before setting new allowance");
+            }
+        }
         owner.require_auth();
         env.storage()
             .persistent()
             .set(&DataKey::Allowance(owner, spender), &AllowanceValue { amount, expires_at });
+    }
+
+    /// Increment the existing allowance for `spender` by `delta`.
+    ///
+    /// If no allowance exists, one is created with `expires_at` set to the
+    /// maximum representable ledger timestamp (effectively never expires).
+    /// If an allowance already exists its `expires_at` is preserved.
+    ///
+    /// Emits an `AllowanceChanged` event with `(owner, spender, old_value,
+    /// new_value)`.
+    ///
+    /// Requires authorization from `owner`.
+    pub fn increase_allowance(env: Env, owner: Address, spender: Address, delta: i128) {
+        if delta <= 0 {
+            panic!("delta must be positive");
+        }
+        owner.require_auth();
+
+        let entry: Option<AllowanceValue> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(owner.clone(), spender.clone()));
+
+        let (old_amount, expires_at) = match entry {
+            None => (0i128, u64::MAX),
+            Some(v) => {
+                if env.ledger().timestamp() > v.expires_at {
+                    (0i128, u64::MAX)
+                } else {
+                    (v.amount, v.expires_at)
+                }
+            }
+        };
+
+        let new_amount = old_amount + delta;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(owner.clone(), spender.clone()), &AllowanceValue {
+                amount: new_amount,
+                expires_at,
+            });
+
+        env.events().publish(
+            (symbol_short!("allowance"), symbol_short!("changed"), owner, spender),
+            (old_amount, new_amount),
+        );
+    }
+
+    /// Decrement the existing allowance for `spender` by `delta`.
+    ///
+    /// Panics if `delta` exceeds the current allowance (underflow protection).
+    ///
+    /// Emits an `AllowanceChanged` event with `(owner, spender, old_value,
+    /// new_value)`.
+    ///
+    /// Requires authorization from `owner`.
+    pub fn decrease_allowance(env: Env, owner: Address, spender: Address, delta: i128) {
+        if delta <= 0 {
+            panic!("delta must be positive");
+        }
+        owner.require_auth();
+
+        let entry: Option<AllowanceValue> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowance(owner.clone(), spender.clone()));
+
+        let (old_amount, expires_at) = match entry {
+            None => (0i128, u64::MAX),
+            Some(v) => {
+                if env.ledger().timestamp() > v.expires_at {
+                    (0i128, u64::MAX)
+                } else {
+                    (v.amount, v.expires_at)
+                }
+            }
+        };
+
+        if delta > old_amount {
+            panic!("delta exceeds current allowance");
+        }
+
+        let new_amount = old_amount - delta;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(owner.clone(), spender.clone()), &AllowanceValue {
+                amount: new_amount,
+                expires_at,
+            });
+
+        env.events().publish(
+            (symbol_short!("allowance"), symbol_short!("changed"), owner, spender),
+            (old_amount, new_amount),
+        );
     }
 
     // ── SEP-41: transfers ─────────────────────────────────────────────────────

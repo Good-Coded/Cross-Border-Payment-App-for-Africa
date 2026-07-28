@@ -456,3 +456,212 @@ fn test_total_supply_consistency_after_mint_transfer_burn_redeem() {
     assert!(client.redeem(&user2)); // burns 100 from user2
     assert_eq!(client.total_supply(), client.balance(&user1) + client.balance(&user2));
 }
+
+// ── Helper for new tests (passes all 3 initialize args correctly) ─────────────
+
+fn setup_v2() -> (Env, LoyaltyTokenContractClient<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = BASE_TIMESTAMP);
+    let contract_id = env.register_contract(None, LoyaltyTokenContract);
+    let client = LoyaltyTokenContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    // Pass transfer_fee_bps = 0 (no fees); initialize requires 3 args.
+    client.initialize(&admin, &DEFAULT_MAX_SUPPLY, &0u32);
+    (env, client, admin)
+}
+
+// ── increase_allowance ────────────────────────────────────────────────────────
+
+/// Increase from zero: allowance starts at 0, delta bumps it to delta.
+#[test]
+fn test_increase_allowance_from_zero() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &200);
+
+    assert_eq!(client.allowance(&owner, &spender), 0);
+    client.increase_allowance(&owner, &spender, &50);
+    assert_eq!(client.allowance(&owner, &spender), 50);
+}
+
+/// Increase from non-zero: existing allowance accumulates correctly.
+#[test]
+fn test_increase_allowance_from_nonzero() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &200);
+
+    client.approve(&owner, &spender, &30, &FAR_FUTURE);
+    assert_eq!(client.allowance(&owner, &spender), 30);
+
+    client.increase_allowance(&owner, &spender, &20);
+    assert_eq!(client.allowance(&owner, &spender), 50);
+}
+
+/// increase_allowance with zero delta must panic.
+#[test]
+#[should_panic(expected = "delta must be positive")]
+fn test_increase_allowance_zero_delta_panics() {
+    let (env, client, _admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.increase_allowance(&owner, &spender, &0);
+}
+
+// ── decrease_allowance ────────────────────────────────────────────────────────
+
+/// Decrease to zero: delta equals the current allowance.
+#[test]
+fn test_decrease_allowance_to_zero() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &200);
+
+    client.approve(&owner, &spender, &50, &FAR_FUTURE);
+    client.decrease_allowance(&owner, &spender, &50);
+    assert_eq!(client.allowance(&owner, &spender), 0);
+}
+
+/// Decrease below zero: delta exceeds current allowance → must panic.
+#[test]
+#[should_panic(expected = "delta exceeds current allowance")]
+fn test_decrease_allowance_below_zero_panics() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &200);
+
+    client.approve(&owner, &spender, &40, &FAR_FUTURE);
+    // delta (41) > allowance (40) → panic
+    client.decrease_allowance(&owner, &spender, &41);
+}
+
+/// Decrease from non-zero to a smaller non-zero value.
+#[test]
+fn test_decrease_allowance_partial() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &200);
+
+    client.approve(&owner, &spender, &100, &FAR_FUTURE);
+    client.decrease_allowance(&owner, &spender, &60);
+    assert_eq!(client.allowance(&owner, &spender), 40);
+}
+
+/// Decrease with zero delta must panic.
+#[test]
+#[should_panic(expected = "delta must be positive")]
+fn test_decrease_allowance_zero_delta_panics() {
+    let (env, client, _admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.decrease_allowance(&owner, &spender, &0);
+}
+
+// ── approve race-condition guard ──────────────────────────────────────────────
+
+/// approve must panic when a non-zero allowance already exists and the new
+/// amount is also non-zero.
+#[test]
+#[should_panic(expected = "Reset to zero before setting new allowance")]
+fn test_approve_race_guard_panics_when_nonzero_allowance_exists() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &200);
+
+    // Set an initial allowance of 50.
+    client.approve(&owner, &spender, &50, &FAR_FUTURE);
+    assert_eq!(client.allowance(&owner, &spender), 50);
+
+    // Attempting to replace it directly with a new non-zero value must panic.
+    client.approve(&owner, &spender, &80, &FAR_FUTURE);
+}
+
+/// approve must succeed when resetting to zero first, then setting a new value.
+#[test]
+fn test_approve_reset_to_zero_then_set_new_value_succeeds() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &200);
+
+    // Set initial allowance.
+    client.approve(&owner, &spender, &50, &FAR_FUTURE);
+    // Reset to zero.
+    client.approve(&owner, &spender, &0, &FAR_FUTURE);
+    assert_eq!(client.allowance(&owner, &spender), 0);
+    // Now set a new non-zero value — this should succeed.
+    client.approve(&owner, &spender, &80, &FAR_FUTURE);
+    assert_eq!(client.allowance(&owner, &spender), 80);
+}
+
+/// approve with amount = 0 is always allowed, even if allowance is non-zero
+/// (this is how you revoke/reset).
+#[test]
+fn test_approve_zero_amount_always_allowed() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &200);
+
+    client.approve(&owner, &spender, &50, &FAR_FUTURE);
+    // Revoking with amount = 0 must not trigger the race guard.
+    client.approve(&owner, &spender, &0, &FAR_FUTURE);
+    assert_eq!(client.allowance(&owner, &spender), 0);
+}
+
+/// approve on a fresh allowance (zero) with a non-zero amount must succeed.
+#[test]
+fn test_approve_on_zero_allowance_succeeds() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &200);
+
+    assert_eq!(client.allowance(&owner, &spender), 0);
+    client.approve(&owner, &spender, &100, &FAR_FUTURE);
+    assert_eq!(client.allowance(&owner, &spender), 100);
+}
+
+// ── AllowanceChanged event data integrity ─────────────────────────────────────
+
+/// Verify that increase_allowance correctly reflects old and new values by
+/// chaining multiple calls and checking the final state.
+#[test]
+fn test_increase_allowance_chained_updates() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &500);
+
+    client.increase_allowance(&owner, &spender, &10);
+    assert_eq!(client.allowance(&owner, &spender), 10);
+
+    client.increase_allowance(&owner, &spender, &25);
+    assert_eq!(client.allowance(&owner, &spender), 35);
+
+    client.increase_allowance(&owner, &spender, &15);
+    assert_eq!(client.allowance(&owner, &spender), 50);
+}
+
+/// Verify decrease_allowance followed by increase_allowance round-trips.
+#[test]
+fn test_decrease_then_increase_allowance_round_trip() {
+    let (env, client, admin) = setup_v2();
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    client.mint(&admin, &owner, &500);
+
+    client.approve(&owner, &spender, &100, &FAR_FUTURE);
+    client.decrease_allowance(&owner, &spender, &60);
+    assert_eq!(client.allowance(&owner, &spender), 40);
+
+    client.increase_allowance(&owner, &spender, &30);
+    assert_eq!(client.allowance(&owner, &spender), 70);
+}
