@@ -706,3 +706,167 @@ fn test_get_all_accumulated_fees_excludes_fully_withdrawn_tokens() {
     assert_eq!(addr, xlm_id);
     assert_eq!(bal, 200_0000000);
 }
+
+// ── circuit-breaker pause ─────────────────────────────────────────────────────
+
+#[test]
+fn test_is_paused_false_by_default() {
+    let (_, client, _, _) = setup();
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_pause_sets_paused_flag() {
+    let (_, client, admin, _) = setup();
+    client.pause(&admin);
+    assert!(client.is_paused());
+}
+
+#[test]
+fn test_unpause_clears_paused_flag() {
+    let (_, client, admin, _) = setup();
+    client.pause(&admin);
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_pause_unpause_cycle() {
+    let (_, client, admin, _) = setup();
+    // starts unpaused
+    assert!(!client.is_paused());
+    // pause
+    client.pause(&admin);
+    assert!(client.is_paused());
+    // unpause
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+    // can pause again
+    client.pause(&admin);
+    assert!(client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Contract is paused")]
+fn test_deposit_fee_panics_when_paused() {
+    let (env, client, admin, usdc_id) = setup();
+    let depositor = Address::generate(&env);
+    mint(&env, &usdc_id, &depositor, 500_0000000);
+    client.pause(&admin);
+    client.deposit_fee(&depositor, &500_0000000, &None);
+}
+
+#[test]
+#[should_panic(expected = "Contract is paused")]
+fn test_withdraw_fees_panics_when_paused() {
+    let (env, client, admin, usdc_id) = setup();
+    let depositor = Address::generate(&env);
+    mint(&env, &usdc_id, &depositor, 500_0000000);
+    // deposit while unpaused so there are funds to attempt withdrawal
+    client.deposit_fee(&depositor, &500_0000000, &None);
+    client.pause(&admin);
+    client.withdraw_fees(&admin, &500_0000000);
+}
+
+#[test]
+fn test_get_accumulated_fees_readable_when_paused() {
+    let (env, client, admin, usdc_id) = setup();
+    let depositor = Address::generate(&env);
+    mint(&env, &usdc_id, &depositor, 300_0000000);
+    client.deposit_fee(&depositor, &300_0000000, &None);
+    client.pause(&admin);
+    // read-only operation must remain accessible
+    assert_eq!(client.get_accumulated_fees(), 300_0000000);
+}
+
+#[test]
+fn test_is_paused_readable_when_paused() {
+    let (_, client, admin, _) = setup();
+    client.pause(&admin);
+    // is_paused itself must be callable when paused
+    assert!(client.is_paused());
+}
+
+#[test]
+fn test_deposit_succeeds_after_unpause() {
+    let (env, client, admin, usdc_id) = setup();
+    let depositor = Address::generate(&env);
+    mint(&env, &usdc_id, &depositor, 500_0000000);
+    client.pause(&admin);
+    client.unpause(&admin);
+    // should not panic now
+    client.deposit_fee(&depositor, &500_0000000, &None);
+    assert_eq!(client.get_accumulated_fees(), 500_0000000);
+}
+
+#[test]
+fn test_withdraw_succeeds_after_unpause() {
+    let (env, client, admin, usdc_id) = setup();
+    let depositor = Address::generate(&env);
+    mint(&env, &usdc_id, &depositor, 500_0000000);
+    client.deposit_fee(&depositor, &500_0000000, &None);
+    client.pause(&admin);
+    client.unpause(&admin);
+    // should not panic now
+    client.withdraw_fees(&admin, &500_0000000);
+    assert_eq!(client.get_accumulated_fees(), 0);
+}
+
+#[test]
+fn test_pause_emits_contract_paused_event() {
+    let (env, client, admin, _) = setup();
+    let pause_at: u64 = 12_345;
+    env.ledger().with_mut(|li| li.timestamp = pause_at);
+    client.pause(&admin);
+
+    let event_name: Val = Symbol::new(&env, "ContractPaused").into_val(&env);
+    let events = env.events().all();
+    let pause_event = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|t| t == &event_name)
+    });
+    assert!(pause_event.is_some(), "ContractPaused event not emitted");
+
+    let (_, _, data) = pause_event.unwrap();
+    let payload: crate::EvtContractPaused = soroban_sdk::from_val(&env, data);
+    assert_eq!(payload.admin, admin);
+    assert_eq!(payload.paused_at, pause_at);
+}
+
+#[test]
+fn test_unpause_emits_contract_unpaused_event() {
+    let (env, client, admin, _) = setup();
+    client.pause(&admin);
+
+    let unpause_at: u64 = 99_000;
+    env.ledger().with_mut(|li| li.timestamp = unpause_at);
+    client.unpause(&admin);
+
+    let event_name: Val = Symbol::new(&env, "ContractUnpaused").into_val(&env);
+    let events = env.events().all();
+    let unpause_event = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|t| t == &event_name)
+    });
+    assert!(unpause_event.is_some(), "ContractUnpaused event not emitted");
+
+    let (_, _, data) = unpause_event.unwrap();
+    let payload: crate::EvtContractUnpaused = soroban_sdk::from_val(&env, data);
+    assert_eq!(payload.admin, admin);
+    assert_eq!(payload.unpaused_at, unpause_at);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: caller is not admin")]
+fn test_pause_non_admin_panics() {
+    let (env, client, _, _) = setup();
+    let impostor = Address::generate(&env);
+    client.pause(&impostor);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: caller is not admin")]
+fn test_unpause_non_admin_panics() {
+    let (env, client, admin, _) = setup();
+    client.pause(&admin);
+    let impostor = Address::generate(&env);
+    client.unpause(&impostor);
+}
