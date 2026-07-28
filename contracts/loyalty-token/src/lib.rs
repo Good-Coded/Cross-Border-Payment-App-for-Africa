@@ -42,6 +42,7 @@ pub enum DataKey {
     TransferFeeBps,
     Balance(Address),
     Allowance(Address, Address), // (owner, spender)
+    KycContractAddress,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -160,11 +161,16 @@ impl LoyaltyTokenContract {
     /// Transfer `amount` points from the caller to `to`.
     /// If a `transfer_fee_bps` was set at initialisation, the fee is deducted
     /// from the transferred amount and credited to the admin.
+    /// Both sender and recipient must be KYC-verified if KYC contract is set.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
         }
         from.require_auth();
+
+        // KYC check if contract address is set
+        Self::_check_kyc_for_transfer(&env, &from, &to);
+
         Self::_debit(&env, &from, amount);
 
         let fee_bps: u32 = env
@@ -188,6 +194,7 @@ impl LoyaltyTokenContract {
 
     /// Transfer `amount` points from `from` to `to` using an allowance.
     /// The fee (if any) is deducted from the transferred amount and credited to admin.
+    /// Both sender and recipient must be KYC-verified if KYC contract is set.
     pub fn transfer_from(
         env: Env,
         spender: Address,
@@ -199,6 +206,9 @@ impl LoyaltyTokenContract {
             panic!("amount must be positive");
         }
         spender.require_auth();
+
+        // KYC check if contract address is set
+        Self::_check_kyc_for_transfer(&env, &from, &to);
 
         let entry: AllowanceValue = env
             .storage()
@@ -411,5 +421,62 @@ impl LoyaltyTokenContract {
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(bal - amount));
+    }
+
+    fn _check_kyc_for_transfer(env: &Env, from: &Address, to: &Address) {
+        // If KYC contract is not set, skip checks
+        let kyc_contract: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KycContractAddress);
+
+        if let Some(kyc_addr) = kyc_contract {
+            // Cross-contract call to kyc-attestation contract
+            let kyc_client = env.invoke_contract::<bool>(
+                &kyc_addr,
+                &Symbol::new(env, "is_verified"),
+                soroban_sdk::vec![env, from.clone().into_val(env)].into(),
+            );
+
+            if !kyc_client {
+                panic!("Transfer requires KYC verification");
+            }
+
+            let kyc_client_to = env.invoke_contract::<bool>(
+                &kyc_addr,
+                &Symbol::new(env, "is_verified"),
+                soroban_sdk::vec![env, to.clone().into_val(env)].into(),
+            );
+
+            if !kyc_client_to {
+                panic!("Transfer requires KYC verification");
+            }
+        }
+    }
+
+    // ── Admin functions ───────────────────────────────────────────────────────
+
+    /// Set the KYC attestation contract address. Admin-only.
+    ///
+    /// # Arguments
+    /// * `kyc_contract_address` — Address of the kyc-attestation contract.
+    pub fn set_kyc_contract(env: Env, kyc_contract_address: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::KycContractAddress, &kyc_contract_address);
+    }
+
+    /// Get the current KYC contract address (if set).
+    pub fn get_kyc_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::KycContractAddress)
     }
 }

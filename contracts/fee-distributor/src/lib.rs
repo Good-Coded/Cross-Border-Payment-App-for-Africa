@@ -21,6 +21,7 @@ pub enum DataKey {
     Admin,
     UsdcAddress,
     AccumulatedFees,
+    PlatformFeeBps,
 }
 
 // ── Event payloads ────────────────────────────────────────────────────────────
@@ -43,6 +44,14 @@ pub struct EvtFeesWithdrawn {
     pub timestamp: u64,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct FeeRateUpdated {
+    pub old_bps: u32,
+    pub new_bps: u32,
+    pub updated_by: Address,
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -53,15 +62,20 @@ impl FeeDistributorContract {
     /// Initialise the contract. Must be called once.
     ///
     /// # Arguments
-    /// * `admin`        — Address authorised to withdraw accumulated fees.
-    /// * `usdc_address` — Stellar asset contract address for USDC.
-    pub fn initialize(env: Env, admin: Address, usdc_address: Address) {
+    /// * `admin`            — Address authorised to withdraw accumulated fees.
+    /// * `usdc_address`     — Stellar asset contract address for USDC.
+    /// * `platform_fee_bps` — Platform fee rate in basis points (max 1000 = 10%).
+    pub fn initialize(env: Env, admin: Address, usdc_address: Address, platform_fee_bps: u32) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("already initialized");
+        }
+        if platform_fee_bps > 1000 {
+            panic!("platform fee cannot exceed 1000 bps (10%)");
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::UsdcAddress, &usdc_address);
         env.storage().persistent().set(&DataKey::AccumulatedFees, &0i128);
+        env.storage().persistent().set(&DataKey::PlatformFeeBps, &platform_fee_bps);
     }
 
     /// Deposit a platform fee into the contract.
@@ -168,6 +182,50 @@ impl FeeDistributorContract {
         env.events().publish(
             (Symbol::new(&env, "FeesWithdrawn"),),
             EvtFeesWithdrawn { admin, amount, remaining, timestamp: env.ledger().timestamp() },
+        );
+    }
+
+    /// Return the current platform fee rate in basis points.
+    pub fn get_fee_rate(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PlatformFeeBps)
+            .expect("not initialized")
+    }
+
+    /// Update the platform fee rate. Admin-only.
+    ///
+    /// # Arguments
+    /// * `new_bps` — New fee rate in basis points (max 1000 = 10%).
+    pub fn update_fee_rate(env: Env, new_bps: u32) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+
+        if new_bps > 1000 {
+            panic!("fee rate cannot exceed 1000 bps (10%)");
+        }
+
+        let old_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlatformFeeBps)
+            .unwrap_or(0);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeeBps, &new_bps);
+
+        env.events().publish(
+            (Symbol::new(&env, "FeeRateUpdated"),),
+            FeeRateUpdated {
+                old_bps,
+                new_bps,
+                updated_by: admin,
+            },
         );
     }
 }
