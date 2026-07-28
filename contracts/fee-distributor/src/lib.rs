@@ -21,6 +21,7 @@ pub enum DataKey {
     Admin,
     UsdcAddress,
     AccumulatedFees,
+    Paused,
 }
 
 // ── Event payloads ────────────────────────────────────────────────────────────
@@ -41,6 +42,20 @@ pub struct EvtFeesWithdrawn {
     pub amount: i128,
     pub remaining: i128,
     pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EvtContractPaused {
+    pub admin: Address,
+    pub paused_at: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EvtContractUnpaused {
+    pub admin: Address,
+    pub unpaused_at: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -75,6 +90,10 @@ impl FeeDistributorContract {
     pub fn deposit_fee(env: Env, depositor: Address, amount: i128, source: Option<Address>) {
         if amount <= 0 {
             panic!("amount must be positive");
+        }
+
+        if env.storage().persistent().get(&DataKey::Paused).unwrap_or(false) {
+            panic!("Contract is paused");
         }
 
         depositor.require_auth();
@@ -128,6 +147,10 @@ impl FeeDistributorContract {
             panic!("amount must be positive");
         }
 
+        if env.storage().persistent().get(&DataKey::Paused).unwrap_or(false) {
+            panic!("Contract is paused");
+        }
+
         admin.require_auth();
 
         let stored_admin: Address = env
@@ -169,5 +192,67 @@ impl FeeDistributorContract {
             (Symbol::new(&env, "FeesWithdrawn"),),
             EvtFeesWithdrawn { admin, amount, remaining, timestamp: env.ledger().timestamp() },
         );
+    }
+
+    /// Pause the contract, preventing `deposit_fee` and `withdraw_fees` calls.
+    ///
+    /// Only the admin may call this. Emits a `ContractPaused` event.
+    /// Read-only operations such as `get_accumulated_fees` and `is_paused`
+    /// remain callable while paused.
+    ///
+    /// # Arguments
+    /// * `admin` — Must match the admin set during `initialize`.
+    pub fn pause(env: Env, admin: Address) {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+
+        env.storage().persistent().set(&DataKey::Paused, &true);
+
+        env.events().publish(
+            (Symbol::new(&env, "ContractPaused"),),
+            EvtContractPaused { admin, paused_at: env.ledger().timestamp() },
+        );
+    }
+
+    /// Unpause the contract, re-enabling `deposit_fee` and `withdraw_fees`.
+    ///
+    /// Only the admin may call this. Emits a `ContractUnpaused` event.
+    ///
+    /// # Arguments
+    /// * `admin` — Must match the admin set during `initialize`.
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+
+        env.storage().persistent().set(&DataKey::Paused, &false);
+
+        env.events().publish(
+            (Symbol::new(&env, "ContractUnpaused"),),
+            EvtContractUnpaused { admin, unpaused_at: env.ledger().timestamp() },
+        );
+    }
+
+    /// Return `true` if the contract is currently paused, `false` otherwise.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 }
