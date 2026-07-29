@@ -67,7 +67,7 @@ export default function Referrals() {
         <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
           Invite friends to AfriPay. When they complete their first transaction, you earn a{' '}
           <span className="font-semibold text-primary-500">
-            {stats?.credit_per_referral_bps / 100}% fee discount credit
+            {(stats?.credit_per_referral_bps ?? 0) / 100}% fee discount credit
           </span>{' '}
           (valid 90 days).
         </p>
