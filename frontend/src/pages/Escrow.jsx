@@ -65,6 +65,27 @@ export default function Escrow() {
       return;
     }
 
+    // Validate Stellar address format (56 chars, starts with 'G')
+    const validateWallet = (addr, label) => {
+      const trimmed = addr.trim();
+      if (!trimmed.startsWith('G')) {
+        toast.error(`${label} must be a valid Stellar address (starts with G)`);
+        return false;
+      }
+      if (trimmed.length !== 56) {
+        toast.error(`${label} must be 56 characters (got ${trimmed.length})`);
+        return false;
+      }
+      if (!/^[A-Z0-9]+$/.test(trimmed)) {
+        toast.error(`${label} contains invalid characters`);
+        return false;
+      }
+      return true;
+    };
+
+    if (!validateWallet(createForm.agent_wallet, 'Agent wallet')) return;
+    if (!validateWallet(createForm.recipient_wallet, 'Recipient wallet')) return;
+
     setLoading(true);
     try {
       const { data } = await api.post('/escrow/create', createForm);
