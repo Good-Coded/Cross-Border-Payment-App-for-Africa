@@ -103,13 +103,15 @@ pub struct ScheduleCancelled {
 #[derive(Clone)]
 #[contracttype]
 pub struct SchedulePaused {
-    pub id: u64,
+    pub schedule_id: u64,
+    pub paused_at: u64,
 }
 
 #[derive(Clone)]
 #[contracttype]
 pub struct ScheduleResumed {
-    pub id: u64,
+    pub schedule_id: u64,
+    pub next_payment_at: u64,
 }
 
 #[derive(Clone)]
@@ -308,6 +310,9 @@ impl RecurringPaymentsContract {
             .get(&DataKey::Schedule(schedule_id))
             .expect("schedule not found");
 
+        if schedule.status == ScheduleStatus::Paused {
+            panic!("Schedule is paused");
+        }
         if schedule.status != ScheduleStatus::Active {
             panic!("schedule is not active");
         }
@@ -477,18 +482,28 @@ impl RecurringPaymentsContract {
         if schedule.sender != sender {
             panic!("only the sender can pause");
         }
+        if schedule.status == ScheduleStatus::Cancelled {
+            panic!("schedule is cancelled");
+        }
+        if schedule.status == ScheduleStatus::Paused {
+            panic!("schedule is already paused");
+        }
         if schedule.status != ScheduleStatus::Active {
             panic!("schedule is not active");
         }
 
         schedule.status = ScheduleStatus::Paused;
+        let paused_at = env.ledger().timestamp();
         env.storage()
             .persistent()
             .set(&DataKey::Schedule(schedule_id), &schedule);
 
         env.events().publish(
             (Symbol::new(&env, "SchedulePaused"),),
-            SchedulePaused { id: schedule_id },
+            SchedulePaused {
+                schedule_id,
+                paused_at,
+            },
         );
     }
 
@@ -505,18 +520,26 @@ impl RecurringPaymentsContract {
         if schedule.sender != sender {
             panic!("only the sender can resume");
         }
+        if schedule.status == ScheduleStatus::Cancelled {
+            panic!("schedule is cancelled");
+        }
         if schedule.status != ScheduleStatus::Paused {
             panic!("schedule is not paused");
         }
 
+        let next_payment_at = env.ledger().timestamp() + schedule.interval;
         schedule.status = ScheduleStatus::Active;
+        schedule.next_payment_at = next_payment_at;
         env.storage()
             .persistent()
             .set(&DataKey::Schedule(schedule_id), &schedule);
 
         env.events().publish(
             (Symbol::new(&env, "ScheduleResumed"),),
-            ScheduleResumed { id: schedule_id },
+            ScheduleResumed {
+                schedule_id,
+                next_payment_at,
+            },
         );
     }
 

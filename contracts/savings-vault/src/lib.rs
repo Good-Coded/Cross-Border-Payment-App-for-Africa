@@ -44,10 +44,61 @@ pub struct YieldClaimed {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct InterestRateUpdatedEvent {
+    pub admin: Address,
+    pub old_rate: u32,
+    pub new_rate: u32,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct InterestReserveFundedEvent {
+    pub distributor: Address,
+    pub amount: i128,
+    pub new_reserve: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct InsufficientReserveEvent {
+    pub user: Address,
+    pub requested: i128,
+    pub paid: i128,
+    pub reserve_remaining: i128,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EmergencyAnnouncedEvent {
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EmergencyCancelledEvent {
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EmergencyWithdrawnEvent {
+    pub admin: Address,
+    pub user: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct Vault {
     pub balance: i128,
     pub unlock_time: u64,
     pub last_accrue_time: u64,
+    pub accrued_interest: i128,
 }
 
 #[contracttype]
@@ -60,9 +111,13 @@ pub enum DataKey {
     TotalLocked,
     YieldAccrued(Address),
     YieldDistributor,
+    FeeDistributor,
+    InterestReserve,
+    EmergencyWithdrawalAnnounced,
 }
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
+const MAX_INTEREST_BPS: u32 = 2_000;
 
 #[contract]
 pub struct SavingsVaultContract;
@@ -77,10 +132,18 @@ impl SavingsVaultContract {
         env.storage().persistent().set(&DataKey::TokenAddress, &token_address);
         env.storage().persistent().set(&DataKey::PenaltyBps, &penalty_bps);
         env.storage().persistent().set(&DataKey::TotalLocked, &0i128);
+        env.storage().persistent().set(&DataKey::InterestReserve, &0i128);
+        env.storage().persistent().set(&DataKey::InterestRateBps, &0u32);
     }
 
     /// Set the annual interest rate. Only admin may call this.
     pub fn set_interest_rate(env: Env, admin: Address, rate_bps: u32) {
+        Self::update_interest_rate(env, admin, rate_bps);
+    }
+
+    /// Update the annual interest rate. Only admin may call this.
+    /// Capped at 2000 bps (20% APY).
+    pub fn update_interest_rate(env: Env, admin: Address, rate_bps: u32) {
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -90,10 +153,27 @@ impl SavingsVaultContract {
         if admin != stored_admin {
             panic!("unauthorized: caller is not admin");
         }
+        if rate_bps > MAX_INTEREST_BPS {
+            panic!("interest rate cannot exceed 2000 bps");
+        }
+        let old_rate: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InterestRateBps)
+            .unwrap_or(0u32);
         env.storage().persistent().set(&DataKey::InterestRateBps, &rate_bps);
+        env.events().publish(
+            (Symbol::new(&env, "InterestRateUpdated"),),
+            InterestRateUpdatedEvent {
+                admin,
+                old_rate,
+                new_rate: rate_bps,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
-    /// Set the authorized yield distributor address. Only admin may call this.
+    /// Set the authorized fee distributor address. Only admin may call this.
     pub fn set_yield_distributor(env: Env, admin: Address, distributor: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -107,12 +187,161 @@ impl SavingsVaultContract {
         env.storage().persistent().set(&DataKey::YieldDistributor, &distributor);
     }
 
-    /// Accrue interest for a single depositor.
-    ///
-    /// Calculates interest = balance * rate_bps * elapsed_seconds / (10000 * seconds_per_year)
-    /// and credits it to the vault's internal balance. The contract must hold sufficient
-    /// USDC to cover the increased balance when the user later withdraws.
-    pub fn accrue_interest(env: Env, admin: Address, user: Address) {
+    /// Set the authorized fee distributor address. Only admin may call this.
+    pub fn set_fee_distributor(env: Env, admin: Address, distributor: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        env.storage().persistent().set(&DataKey::FeeDistributor, &distributor);
+    }
+
+    /// Fund the interest reserve from the authorized fee distributor.
+    pub fn fund_interest_reserve(env: Env, distributor: Address, amount: i128) {
+        distributor.require_auth();
+        let stored_distributor: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeDistributor)
+            .expect("fee distributor not set");
+        if distributor != stored_distributor {
+            panic!("unauthorized: caller is not fee distributor");
+        }
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenAddress)
+            .expect("Contract not initialized");
+
+        token::Client::new(&env, &token_address).transfer(
+            &distributor,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let reserve: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InterestReserve)
+            .unwrap_or(0);
+        let new_reserve = reserve + amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::InterestReserve, &new_reserve);
+
+        env.events().publish(
+            (Symbol::new(&env, "InterestReserveFunded"),),
+            InterestReserveFundedEvent {
+                distributor,
+                amount,
+                new_reserve,
+            },
+        );
+    }
+
+    fn get_interest_reserve(env: &Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InterestReserve)
+            .unwrap_or(0)
+    }
+
+    fn accrue_interest_internal(env: &Env, vault: &mut Vault, require_rate: bool) -> i128 {
+        let rate_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InterestRateBps)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        if rate_bps == 0 {
+            if require_rate {
+                panic!("interest rate not set");
+            }
+            vault.last_accrue_time = now;
+            return 0;
+        }
+        let elapsed = now.saturating_sub(vault.last_accrue_time);
+        if elapsed == 0 || vault.balance <= 0 {
+            vault.last_accrue_time = now;
+            return 0;
+        }
+        let interest = (vault.balance * rate_bps as i128 * elapsed as i128)
+            / (10_000i128 * SECONDS_PER_YEAR as i128);
+        if interest <= 0 {
+            vault.last_accrue_time = now;
+            return 0;
+        }
+        vault.accrued_interest += interest;
+        vault.last_accrue_time = now;
+        interest
+    }
+
+    fn settle_interest_payment(
+        env: &Env,
+        user: &Address,
+        vault: &mut Vault,
+        withdraw_amount: i128,
+    ) {
+        if vault.accrued_interest <= 0 || withdraw_amount <= 0 || vault.balance <= 0 {
+            return;
+        }
+        let interest_due = (vault.accrued_interest * withdraw_amount) / vault.balance;
+        if interest_due <= 0 {
+            return;
+        }
+        let reserve: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InterestReserve)
+            .unwrap_or(0);
+        let paid = if reserve >= interest_due {
+            interest_due
+        } else {
+            reserve
+        };
+        if paid > 0 {
+            let token_address: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TokenAddress)
+                .expect("Contract not initialized");
+            token::Client::new(&env, &token_address).transfer(
+                &env.current_contract_address(),
+                user,
+                &paid,
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::InterestReserve, &(reserve - paid));
+            vault.accrued_interest -= paid;
+        }
+        if paid < interest_due {
+            let timestamp = env.ledger().timestamp();
+            env.events().publish(
+                (Symbol::new(&env, "InsufficientReserve"),),
+                InsufficientReserveEvent {
+                    user: user.clone(),
+                    requested: interest_due,
+                    paid,
+                    reserve_remaining: reserve - paid,
+                    timestamp,
+                },
+            );
+        }
+    }
+
+    /// Announce an emergency withdrawal. Must be called by admin.
+    /// This creates a 48-hour delay before emergency withdrawals may execute.
+    pub fn announce_emergency(env: Env, admin: Address) {
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -123,45 +352,162 @@ impl SavingsVaultContract {
             panic!("unauthorized: caller is not admin");
         }
 
-        let rate_bps: u32 = env
+        let existing: u64 = env
             .storage()
             .persistent()
-            .get(&DataKey::InterestRateBps)
-            .unwrap_or(0);
-        if rate_bps == 0 {
-            panic!("interest rate not set");
+            .get(&DataKey::EmergencyWithdrawalAnnounced)
+            .unwrap_or(0u64);
+        if existing != 0 {
+            panic!("emergency already announced");
         }
 
+        let now = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyWithdrawalAnnounced, &now);
+        env.events().publish(
+            (Symbol::new(&env, "EmergencyAnnounced"),),
+            EmergencyAnnouncedEvent { admin, timestamp: now },
+        );
+    }
+
+    /// Execute an emergency withdrawal for a user after the 48-hour delay.
+    pub fn emergency_withdraw(env: Env, admin: Address, user: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+
+        let announced_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyWithdrawalAnnounced)
+            .unwrap_or(0u64);
+        if announced_at == 0 {
+            panic!("no emergency announced");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < announced_at.saturating_add(172_800) {
+            panic!("emergency withdrawal not yet allowed");
+        }
+
+        let vault_key = DataKey::Vault(user.clone());
+        let mut vault: Vault = env.storage().persistent().get(&vault_key).expect("No vault found for user");
+        if vault.balance <= 0 {
+            panic!("No balance to withdraw");
+        }
+
+        let amount = vault.balance;
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenAddress)
+            .expect("Contract not initialized");
+
+        token::Client::new(&env, &token_address).transfer(
+            &env.current_contract_address(),
+            &user,
+            &amount,
+        );
+
+        env.storage().persistent().remove(&vault_key);
+
+        let total_locked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLocked)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalLocked, &(total_locked - amount));
+
+        env.events().publish(
+            (Symbol::new(&env, "EmergencyWithdrawn"),),
+            EmergencyWithdrawnEvent {
+                admin,
+                user,
+                amount,
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Cancel a pending emergency withdrawal announcement before the 48-hour delay expires.
+    pub fn cancel_emergency(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+
+        let announced_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyWithdrawalAnnounced)
+            .unwrap_or(0u64);
+        if announced_at == 0 {
+            panic!("no emergency announced");
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= announced_at.saturating_add(172_800) {
+            panic!("cannot cancel after emergency delay has elapsed");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyWithdrawalAnnounced, &0u64);
+        env.events().publish(
+            (Symbol::new(&env, "EmergencyCancelled"),),
+            EmergencyCancelledEvent { admin, timestamp: now },
+        );
+    }
+
+    /// Accrue interest for a single depositor.
+    ///
+    /// Calculates interest = balance * rate_bps * elapsed_seconds / (10000 * seconds_per_year)
+    /// and credits it to the vault's internal balance. The contract must hold sufficient
+    /// USDC to cover the increased balance when the user later withdraws.
+    pub fn accrue_interest(env: Env, user: Address) {
+        user.require_auth();
         let mut vault: Vault = env
             .storage()
             .persistent()
             .get(&DataKey::Vault(user.clone()))
             .expect("No vault found for user");
 
-        let now = env.ledger().timestamp();
-        let elapsed = now.saturating_sub(vault.last_accrue_time);
-
-        let interest = (vault.balance * rate_bps as i128 * elapsed as i128)
-            / (10_000i128 * SECONDS_PER_YEAR as i128);
-
-        if interest <= 0 {
-            return;
-        }
-
-        vault.balance += interest;
-        vault.last_accrue_time = now;
+        let interest = Self::accrue_interest_internal(&env, &mut vault);
         env.storage()
             .persistent()
             .set(&DataKey::Vault(user.clone()), &vault);
 
-        env.events().publish(
-            (Symbol::new(&env, "AccrueInterest"),),
-            AccrueInterestEvent {
-                user,
-                interest,
-                new_balance: vault.balance,
-            },
-        );
+        if interest > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "AccrueInterest"),),
+                AccrueInterestEvent {
+                    user,
+                    interest,
+                    new_balance: vault.balance,
+                },
+            );
+        }
+    }
+
+    pub fn get_interest_rate(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InterestRateBps)
+            .unwrap_or(0u32)
     }
 
     /// Deposit tokens into the vault. Accumulates on top of any existing balance.
@@ -197,6 +543,7 @@ impl SavingsVaultContract {
                 balance: 0,
                 unlock_time: 0,
                 last_accrue_time: now,
+                accrued_interest: 0,
             });
 
         vault.balance += amount;
@@ -265,6 +612,9 @@ impl SavingsVaultContract {
 
         let withdraw_amount = amount - penalty;
 
+        Self::accrue_interest_internal(&env, &mut vault, false);
+        Self::settle_interest_payment(&env, &user, &mut vault, amount);
+
         token::Client::new(&env, &token_address).transfer(
             &env.current_contract_address(),
             &user,
@@ -321,6 +671,7 @@ impl SavingsVaultContract {
                 balance: 0,
                 unlock_time: 0,
                 last_accrue_time: 0,
+                accrued_interest: 0,
             })
     }
 

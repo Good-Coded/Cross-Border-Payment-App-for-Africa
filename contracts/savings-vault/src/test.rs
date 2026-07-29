@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger},
+    testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env, IntoVal, Symbol, Val,
 };
@@ -258,6 +258,75 @@ fn test_get_unlock_time_no_vault() {
     assert_eq!(client.get_unlock_time(&user), 0);
 }
 
+#[test]
+fn test_announce_emergency_sets_timestamp() {
+    let (env, client, admin, _) = setup();
+    client.announce_emergency(&admin);
+
+    let event_name: Val = Symbol::new(&env, "EmergencyAnnounced").into_val(&env);
+    let events = env.events().all();
+    assert_eq!(events.len(), 1);
+    let event = events
+        .iter()
+        .find(|(_, topics, _)| topics.iter().any(|t| t == &event_name))
+        .expect("EmergencyAnnounced event not emitted");
+    let (_, _, data) = event;
+    assert!(data.is_object());
+}
+
+#[test]
+fn test_emergency_withdraw_after_delay() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+    let unlock_time = env.ledger().timestamp() + 86400;
+
+    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    client.deposit(&user, &amount, &unlock_time);
+    client.announce_emergency(&admin);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 172_800);
+
+    client.emergency_withdraw(&admin, &user);
+
+    assert_eq!(client.get_balance(&user), 0);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&user), amount);
+    assert_eq!(client.get_total_locked(), 0);
+}
+
+#[test]
+#[should_panic(expected = "emergency withdrawal not yet allowed")]
+fn test_emergency_withdraw_before_delay_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+    let unlock_time = env.ledger().timestamp() + 86400;
+
+    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    client.deposit(&user, &amount, &unlock_time);
+    client.announce_emergency(&admin);
+
+    client.emergency_withdraw(&admin, &user);
+}
+
+#[test]
+fn test_cancel_emergency_before_delay() {
+    let (env, client, admin, _) = setup();
+    client.announce_emergency(&admin);
+    client.cancel_emergency(&admin);
+
+    let events = env.events().all();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].0, Symbol::new(&env, "EmergencyCancelled"));
+}
+
+#[test]
+#[should_panic(expected = "no emergency announced")]
+fn test_cancel_emergency_without_announcement_panics() {
+    let (_, client, admin, _) = setup();
+    client.cancel_emergency(&admin);
+}
+
 // ── #548: interest accrual ────────────────────────────────────────────────────
 
 #[test]
@@ -289,11 +358,12 @@ fn test_accrue_interest_credits_vault_balance() {
     // Advance 1 year
     env.ledger().with_mut(|li| li.timestamp += 31_536_000);
 
-    client.accrue_interest(&admin, &user);
+    client.accrue_interest(&user);
 
     // 5% of 1000 USDC = 50 USDC
     let expected_interest = 50_0000000i128;
-    assert_eq!(client.get_balance(&user), deposit + expected_interest);
+    assert_eq!(client.get_balance(&user), deposit);
+    assert_eq!(client.get_vault(&user).accrued_interest, expected_interest);
 }
 
 #[test]
@@ -308,7 +378,7 @@ fn test_accrue_interest_emits_event() {
     client.set_interest_rate(&admin, &500u32);
 
     env.ledger().with_mut(|li| li.timestamp += 31_536_000);
-    client.accrue_interest(&admin, &user);
+    client.accrue_interest(&user);
 
     let event_name: Val = Symbol::new(&env, "AccrueInterest").into_val(&env);
     let events = env.events().all();
@@ -353,7 +423,7 @@ fn test_accrue_interest_non_admin_panics() {
 
     let impostor = Address::generate(&env);
     env.ledger().with_mut(|li| li.timestamp += 86400);
-    client.accrue_interest(&impostor, &user);
+    client.accrue_interest(&user);
 }
 
 #[test]
