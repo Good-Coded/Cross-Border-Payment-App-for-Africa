@@ -12,14 +12,10 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// ---------------------------------------------------------------------------
-// Bull email queue (Issue #706)
-// ---------------------------------------------------------------------------
-
 let emailQueue = null;
 let emailWorker = null;
 
-const RETRY_DELAYS = [60_000, 300_000, 1_800_000]; // 1 min, 5 min, 30 min
+const RETRY_DELAYS = [60_000, 300_000, 1_800_000];
 
 function getRedisConnection() {
   if (!process.env.REDIS_URL) return null;
@@ -58,7 +54,6 @@ function initEmailQueue() {
     },
     {
       connection: getRedisConnection(),
-      // custom backoff uses RETRY_DELAYS array
       settings: {
         backoffStrategy: (attemptsMade) => RETRY_DELAYS[attemptsMade - 1] ?? 1_800_000,
       },
@@ -78,15 +73,10 @@ function initEmailQueue() {
   logger.info('Email queue initialized');
 }
 
-/**
- * Enqueue an email job (fire-and-forget from the request perspective).
- * Falls back to synchronous send if Redis is unavailable.
- */
 async function enqueueEmail(jobData) {
   if (emailQueue) {
     return emailQueue.add('send', jobData);
   }
-  // Fallback: send synchronously
   return transporter.sendMail({
     from: process.env.SMTP_FROM || process.env.SMTP_USER,
     to: jobData.to,
@@ -100,9 +90,9 @@ async function drainEmailQueue() {
   if (emailQueue) await emailQueue.close();
 }
 
-// ---------------------------------------------------------------------------
-// Transactional email helpers
-// ---------------------------------------------------------------------------
+function getEmailQueue() {
+  return emailQueue;
+}
 
 async function sendVerificationEmail(email, token) {
   const url = `${process.env.FRONTEND_URL}/verify-email?token=${token}`;
@@ -111,29 +101,6 @@ async function sendVerificationEmail(email, token) {
     subject: 'Verify your AfriPay email',
     html: `<p>Click the link below to verify your email. It expires in 96 hours.</p>
            <a href="${url}">${url}</a>`,
-  });
-}
-
-async function sendExpiryNotification(email, name, recipientWallet, amount, asset, daysLeft, type) {
-  const subject = type === 'sender'
-    ? `Your claimable balance expires in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`
-    : `You have unclaimed funds expiring in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`;
-
-  const message = type === 'sender'
-    ? `<p>Hi ${name},</p>
-       <p>Your claimable balance of <strong>${amount} ${asset}</strong> sent to <code>${recipientWallet}</code> will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong>.</p>
-       <p>If the recipient doesn't claim the funds before expiry, they will be automatically returned to your account.</p>
-       <p>Transaction details: <a href="${process.env.FRONTEND_URL}/history">View in AfriPay</a></p>`
-    : `<p>Hi ${name},</p>
-       <p>You have unclaimed funds of <strong>${amount} ${asset}</strong> waiting for you!</p>
-       <p>These funds will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong> if not claimed.</p>
-       <p><a href="${process.env.FRONTEND_URL}/dashboard">Claim your funds now</a></p>`;
-
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: email,
-    subject,
-    html: message
   });
 }
 
@@ -149,21 +116,19 @@ async function sendPasswordResetEmail(email, token) {
 }
 
 async function sendExpiryNotification(email, name, recipientWallet, amount, asset, daysLeft, type) {
-  const subject =
-    type === 'sender'
-      ? `Your claimable balance expires in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`
-      : `You have unclaimed funds expiring in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`;
+  const subject = type === 'sender'
+    ? `Your claimable balance expires in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`
+    : `You have unclaimed funds expiring in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`;
 
-  const html =
-    type === 'sender'
-      ? `<p>Hi ${name},</p>
-         <p>Your claimable balance of <strong>${amount} ${asset}</strong> sent to <code>${recipientWallet}</code> will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong>.</p>
-         <p>If the recipient doesn't claim the funds before expiry, they will be automatically returned to your account.</p>
-         <p><a href="${process.env.FRONTEND_URL}/history">View in AfriPay</a></p>`
-      : `<p>Hi ${name},</p>
-         <p>You have unclaimed funds of <strong>${amount} ${asset}</strong> waiting for you!</p>
-         <p>These funds will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong> if not claimed.</p>
-         <p><a href="${process.env.FRONTEND_URL}/dashboard">Claim your funds now</a></p>`;
+  const html = type === 'sender'
+    ? `<p>Hi ${name},</p>
+       <p>Your claimable balance of <strong>${amount} ${asset}</strong> sent to <code>${recipientWallet}</code> will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong>.</p>
+       <p>If the recipient doesn't claim the funds before expiry, they will be automatically returned to your account.</p>
+       <p><a href="${process.env.FRONTEND_URL}/history">View in AfriPay</a></p>`
+    : `<p>Hi ${name},</p>
+       <p>You have unclaimed funds of <strong>${amount} ${asset}</strong> waiting for you!</p>
+       <p>These funds will expire in <strong>${daysLeft} day${daysLeft > 1 ? 's' : ''}</strong> if not claimed.</p>
+       <p><a href="${process.env.FRONTEND_URL}/dashboard">Claim your funds now</a></p>`;
 
   return enqueueEmail({ to: email, subject, html });
 }
@@ -227,17 +192,11 @@ async function sendTransactionEmail(email, type, tx) {
     </div>
   `;
 
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: email,
-    subject,
-    html,
-  });
+  return enqueueEmail({ to: email, subject, html });
 }
 
 async function sendPaymentRequestExpiredEmail(email, amount, asset) {
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+  return enqueueEmail({
     to: email,
     subject: 'Your AfriPay payment request has expired',
     html: `<p>Your payment request for <strong>${amount} ${asset}</strong> has expired and is no longer active.</p>
@@ -246,8 +205,7 @@ async function sendPaymentRequestExpiredEmail(email, amount, asset) {
 }
 
 async function sendBackupCodeWarningEmail(email, remaining) {
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+  return enqueueEmail({
     to: email,
     subject: 'AfriPay: Low 2FA backup codes remaining',
     html: `<p>You only have <strong>${remaining}</strong> backup code${remaining === 1 ? '' : 's'} remaining for your AfriPay account.</p>
@@ -255,18 +213,16 @@ async function sendBackupCodeWarningEmail(email, remaining) {
   });
 }
 
-module.exports = {
-  sendVerificationEmail,
-  sendExpiryNotification,
-  sendPasswordResetEmail,
-  sendTransactionEmail,
-  sendPaymentRequestExpiredEmail,
-  sendBackupCodeWarningEmail,
+async function sendKycExpiryReminderEmail(email, name, daysRemaining) {
+  const subject = `Action required: Your AfriPay identity document expires in ${daysRemaining} day${daysRemaining !== 1 ? 's' : ''}`;
+  const html = `
+    <p>Hi ${name},</p>
+    <p>Your identity document on file with AfriPay will expire in <strong>${daysRemaining} day${daysRemaining !== 1 ? 's' : ''}</strong>.</p>
+    <p>To continue using AfriPay without interruption, please re-submit your KYC documents before the expiry date.</p>
+    <p><a href="${process.env.FRONTEND_URL}/kyc">Re-verify my identity</a></p>
+    <p style="font-size:12px;color:#9ca3af">If you have already re-submitted, you can ignore this reminder.</p>
+  `;
   return enqueueEmail({ to: email, subject, html });
-}
-
-function getEmailQueue() {
-  return emailQueue;
 }
 
 module.exports = {
@@ -278,22 +234,7 @@ module.exports = {
   sendPasswordResetEmail,
   sendExpiryNotification,
   sendTransactionEmail,
+  sendPaymentRequestExpiredEmail,
+  sendBackupCodeWarningEmail,
+  sendKycExpiryReminderEmail,
 };
-async function sendKycExpiryReminderEmail(email, name, daysRemaining) {
-  const subject = `Action required: Your AfriPay identity document expires in ${daysRemaining} day${daysRemaining !== 1 ? 's' : ''}`;
-  const html = `
-    <p>Hi ${name},</p>
-    <p>Your identity document on file with AfriPay will expire in <strong>${daysRemaining} day${daysRemaining !== 1 ? 's' : ''}</strong>.</p>
-    <p>To continue using AfriPay without interruption, please re-submit your KYC documents before the expiry date.</p>
-    <p><a href="${process.env.FRONTEND_URL}/kyc">Re-verify my identity</a></p>
-    <p style="font-size:12px;color:#9ca3af">If you have already re-submitted, you can ignore this reminder.</p>
-  `;
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: email,
-    subject,
-    html,
-  });
-}
-
-module.exports = { sendVerificationEmail, sendPasswordResetEmail, sendTransactionEmail, sendKycExpiryReminderEmail };

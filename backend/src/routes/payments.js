@@ -1,5 +1,4 @@
 const router = require("express").Router();
-﻿const router = require("express").Router();
 const { body, query, validationResult } = require("express-validator");
 const rateLimit = require("express-rate-limit");
 const StellarSdk = require("@stellar/stellar-sdk");
@@ -111,26 +110,6 @@ router.get(
     }
   },
 );
-
-/**
- * POST /api/payments/send
- * @protected @idempotent
- * Idempotency-Key header prevents duplicate payments on client retry.
- * Closes #492
- */
-router.post(
-  "/send",
-  paymentSendValidators,
-  validate,
-  idempotency,
-  send,
-);
-
-/**
- * POST /api/payments/batch
- * @protected @idempotent
- */
-router.post("/batch", paymentBatchValidators, validate, idempotency, sendBatch);
 
 /**
  * @swagger
