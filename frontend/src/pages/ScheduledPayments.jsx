@@ -53,6 +53,20 @@ export default function ScheduledPayments() {
       return;
     }
 
+    // Check balance before scheduling
+    try {
+      const balanceRes = await api.get('/wallet/balance');
+      const balances = balanceRes.data?.balances || [];
+      const assetBalance = balances.find(b => b.asset === form.asset)?.balance || 0;
+
+      if (parseFloat(form.amount) > parseFloat(assetBalance)) {
+        toast.error(`Insufficient ${form.asset} balance`);
+        return;
+      }
+    } catch {
+      // If balance check fails, proceed — backend will validate anyway
+    }
+
     try {
       await api.post('/scheduled-payments', {
         execute_at: new Date(Date.now() + 3600000).toISOString(),
