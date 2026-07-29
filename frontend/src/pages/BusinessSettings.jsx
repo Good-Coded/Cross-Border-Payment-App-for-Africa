@@ -77,10 +77,26 @@ export default function BusinessSettings() {
 
   const handleAddSigner = async (e) => {
     e.preventDefault();
+
+    // Validate Stellar public key format before submitting
+    const key = newKey.trim();
+    if (!key.startsWith('G')) {
+      toast.error('Invalid Stellar address — must start with "G"');
+      return;
+    }
+    if (key.length !== 56) {
+      toast.error(`Invalid Stellar address — must be 56 characters (got ${key.length})`);
+      return;
+    }
+    if (!/^[A-Z0-9]+$/.test(key)) {
+      toast.error('Invalid Stellar address — contains invalid characters');
+      return;
+    }
+
     setAdding(true);
     try {
-      const res = await api.post('/wallet/signers', { signer_public_key: newKey.trim(), label: newLabel.trim() || undefined });
-      setSigners(prev => [...prev, { signer_public_key: newKey.trim(), label: newLabel.trim() || null, added_at: new Date().toISOString() }]);
+      const res = await api.post('/wallet/signers', { signer_public_key: key, label: newLabel.trim() || undefined });
+      setSigners(prev => [...prev, { signer_public_key: key, label: newLabel.trim() || null, added_at: new Date().toISOString() }]);
       setNewKey('');
       setNewLabel('');
       toast.success('Signer added');
