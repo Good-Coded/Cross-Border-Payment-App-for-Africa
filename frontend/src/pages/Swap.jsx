@@ -38,7 +38,7 @@ export default function Swap() {
 
   const applySlippage = (value) => {
     const v = parseFloat(value);
-    if (!isNaN(v) && v > 0) {
+    if (!isNaN(v) && v > 0 && v <= 50) {
       setSlippage(v);
       localStorage.setItem(SLIPPAGE_STORAGE_KEY, String(v));
     }
