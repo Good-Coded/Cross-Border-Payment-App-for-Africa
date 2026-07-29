@@ -1,5 +1,8 @@
-﻿const { v4: uuidv4 } = require("uuid");
+const { v4: uuidv4 } = require("uuid");
 const { stringify } = require("csv-stringify/sync");
+const { stringify: csvStream } = require("csv-stringify");
+const { stringify: stringifySync } = require("csv-stringify/sync");
+const { stringify: stringifyStream } = require("csv-stringify");
 const db = require("../db");
 const StellarSdk = require("@stellar/stellar-sdk");
 const {
@@ -16,24 +19,57 @@ const {
 } = require("../services/stellar");
 const webhook = require("../services/webhook");
 const cache = require("../utils/cache");
+<<<<<<< rss
+const { sendTransactionEmail, enqueueEmail } = require("../services/email");
+=======
 const { sendTransactionEmail } = require("../services/email");
+const { persistAndBroadcast } = require("../services/notificationInbox");
+>>>>>>> main
 const { checkVelocity, checkDailyLimit } = require("../services/fraudDetection");
 const { checkFraud, logFraudBlock } = require("../services/fraudDetection");
 const { parseHistoryFrom, parseHistoryTo, normalizeAsset, validateDateRange } = require("../utils/historyQuery");
 const { isMemoRequired } = require("../services/memoRequired");
-const { awardReferralCredit } = require("./referralController");
-const { mintPoints } = require("../services/loyaltyToken");
+const { creditReferralReward } = require("../services/referralRewardService");
+const { enqueueLoyaltyMint } = require("../jobs/loyaltyMintJob");
 const { depositFee } = require("../services/feeDistributor");
+const { getActiveConfig } = require("../services/feeConfigService");
 const logger = require("../utils/logger");
+const { cancelEscrow } = require("../services/agentEscrow");
+const audit = require("../services/audit");
 
-// Configurable KYC transaction threshold in USD equivalent
 const KYC_THRESHOLD_USD = parseFloat(process.env.KYC_THRESHOLD_USD || "100");
 
-// Platform fee in basis points (e.g. 50 = 0.5%)
-const FEE_BPS = parseInt(process.env.FEE_BPS || "50", 10);
+const FALLBACK_PLATFORM_FEE_BPS = parseInt(process.env.PLATFORM_FEE_BPS || "250", 10);
 
-function calculateFee(amount) {
-  return parseFloat((parseFloat(amount) * FEE_BPS / 10000).toFixed(7));
+/**
+ * Build the structured fee breakdown for a payment.
+ * @param {string|number} grossAmount  - Amount the sender sent
+ * @param {string}        asset        - e.g. "USDC" or "XLM"
+ * @param {string|null}   feeCharged   - Stellar fee_charged in stroops (from Horizon result)
+ */
+async function buildFeeBreakdown(grossAmount, asset, feeCharged) {
+  const gross = parseFloat(grossAmount);
+  let feeBps = FALLBACK_PLATFORM_FEE_BPS;
+  try {
+    const cfg = await getActiveConfig('platform', asset);
+    if (cfg) feeBps = cfg.fee_bps;
+  } catch (_) {
+    // fall back to env var if cache/DB is unavailable
+  }
+  const platformFee = parseFloat((gross * feeBps / 10000).toFixed(7));
+  const stellarBaseFeeXlm = feeCharged != null
+    ? parseFloat((parseInt(feeCharged, 10) / 1e7).toFixed(7))
+    : null;
+  const netAmount = parseFloat((gross - platformFee).toFixed(7));
+
+  return {
+    gross_amount_usdc: parseFloat(gross.toFixed(7)),
+    platform_fee_bps: feeBps,
+    platform_fee_usdc: platformFee,
+    stellar_base_fee_xlm: stellarBaseFeeXlm,
+    net_amount_usdc: parseFloat(netAmount.toFixed(7)),
+    asset,
+  };
 }
 
 // Approximate XLM/USD rate  in production replace with a live price feed
@@ -112,6 +148,12 @@ async function ensureKycIfNeeded(userId, amount, asset) {
 
   const kycResult = await db.query("SELECT kyc_status FROM users WHERE id = $1", [userId]);
   const kycStatus = kycResult.rows[0]?.kyc_status || "unverified";
+  if (kycStatus === "expired") {
+    const err = new Error("Your identity document has expired. Please re-verify to continue.");
+    err.status = 403;
+    err.payload = { kyc_status: kycStatus, code: "KYC_EXPIRED" };
+    throw err;
+  }
   if (kycStatus !== "verified") {
     const err = new Error(
       `KYC verification required for transactions above $${KYC_THRESHOLD_USD} USD equivalent.`,
@@ -160,6 +202,45 @@ async function estimateFee(req, res, next) {
   }
 }
 
+/**
+ * GET /api/payments/estimate-fees?amount=100&asset=USDC
+ * Returns a pre-submission fee breakdown without processing a payment.
+ */
+async function estimateFees(req, res, next) {
+  try {
+    const { amount, asset = "USDC" } = req.query;
+    if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+      return res.status(400).json({ error: "amount must be a positive number" });
+    }
+    const VALID = ["XLM", "USDC", "NGN", "GHS", "KES"];
+    if (!VALID.includes(asset)) {
+      return res.status(400).json({ error: `asset must be one of: ${VALID.join(", ")}` });
+    }
+    let stellarFeeStroops = null;
+    try { stellarFeeStroops = await fetchFee(); } catch (_) { /* non-fatal */ }
+    const breakdown = await buildFeeBreakdown(amount, asset, stellarFeeStroops);
+    res.json({ fee_breakdown: breakdown });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getFeeRate(req, res, next) {
+  try {
+    let feeBps = FALLBACK_PLATFORM_FEE_BPS;
+    const asset = req.query.asset || 'USDC';
+    try {
+      const cfg = await getActiveConfig('platform', asset);
+      if (cfg) feeBps = cfg.fee_bps;
+    } catch (_) {
+      // fall back to env var
+    }
+    res.json({ fee_bps: feeBps });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function getFeeStats(req, res, next) {
   try {
     const stats = await fetchFeeStats();
@@ -182,11 +263,7 @@ async function getFeeStats(req, res, next) {
 async function send(req, res, next) {
   const txId = uuidv4();
   // declare these in outer scope so the catch block can reference them safely
-  let public_key, encrypted_secret_key, recipient_address, amount, asset, memo;
-  try {
-    ({ recipient_address, amount, asset = "XLM", memo } = req.body);
-  let public_key;
-  let recipient_address, amount, asset, memo, memo_type;
+  let public_key, encrypted_secret_key, recipient_address, amount, asset, memo, memo_type;
 
   try {
     ({
@@ -221,13 +298,23 @@ async function send(req, res, next) {
         });
       }
 
-      if (kycStatus !== "verified" && estimatedUSD >= KYC_THRESHOLD_USD) {
-        webhook.deliver("payment.failed", { code: "KYC_REQUIRED", error: "KYC verification required for transactions above $" + KYC_THRESHOLD_USD + " USD equivalent." }).catch(() => {});
-        return res.status(403).json({
-          error: "KYC verification required for transactions above $" + KYC_THRESHOLD_USD + " USD equivalent.",
-          kyc_status: kycStatus,
-          code: "KYC_REQUIRED",
-        });
+      if (estimatedUSD >= KYC_THRESHOLD_USD) {
+        if (kycStatus === "expired") {
+          webhook.deliver("payment.failed", { code: "KYC_EXPIRED", error: "Your identity document has expired. Please re-verify to continue." }).catch(() => {});
+          return res.status(403).json({
+            error: "Your identity document has expired. Please re-verify to continue.",
+            kyc_status: kycStatus,
+            code: "KYC_EXPIRED",
+          });
+        }
+        if (kycStatus !== "verified") {
+          webhook.deliver("payment.failed", { code: "KYC_REQUIRED", error: "KYC verification required for transactions above $" + KYC_THRESHOLD_USD + " USD equivalent." }).catch(() => {});
+          return res.status(403).json({
+            error: "KYC verification required for transactions above $" + KYC_THRESHOLD_USD + " USD equivalent.",
+            kyc_status: kycStatus,
+            code: "KYC_REQUIRED",
+          });
+        }
       }
     }
 
@@ -248,8 +335,6 @@ async function send(req, res, next) {
     if (!walletResult.rows[0]) return res.status(404).json({ error: "Wallet not found" });
 
     ({ public_key, encrypted_secret_key } = walletResult.rows[0]);
-    ({ public_key } = walletResult.rows[0]);
-    const { encrypted_secret_key } = walletResult.rows[0];
 
     if (recipient_address === public_key) {
       return res.status(400).json({ error: "Cannot send payment to your own wallet" });
@@ -299,7 +384,7 @@ async function send(req, res, next) {
     await checkSufficientBalance(public_key, amount, asset);
 
     // Broadcast to Stellar
-    const { transactionHash, ledger, type, claimableBalanceId } = await sendPayment({
+    const { transactionHash, ledger, type, claimableBalanceId, feeCharged } = await sendPayment({
       senderPublicKey: public_key,
       encryptedSecretKey: encrypted_secret_key,
       recipientPublicKey: recipient_address,
@@ -312,12 +397,15 @@ async function send(req, res, next) {
 
     const ledger_close_time = await fetchLedgerCloseTime(ledger);
 
+    // Build fee breakdown
+    const fee_breakdown = await buildFeeBreakdown(amount, asset, feeCharged ?? null);
+
     // Save to DB
     const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
     await db.query(
-      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-      [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time],
+      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+      [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(fee_breakdown)],
     );
 
     if (type !== "claimable_balance") {
@@ -331,15 +419,14 @@ async function send(req, res, next) {
       [public_key],
     );
     if (parseInt(txCount.rows[0].cnt, 10) === 1) {
-      awardReferralCredit(req.user.userId).catch(() => {});
+      creditReferralReward(req.user.userId, txId).catch(() => {});
     }
 
-    const loyaltyPoints = Math.max(1, Math.floor(parseFloat(amount)));
-    mintPoints({ recipientWallet: public_key, points: loyaltyPoints }).catch(() => {});
+    // Queue loyalty mint for background processing after confirmation
+    enqueueLoyaltyMint(txId, req.user.userId, public_key, amount, asset).catch(() => {});
 
-    const PLATFORM_FEE_BPS = parseInt(process.env.PLATFORM_FEE_BPS || "250", 10);
-    if (asset === "USDC" && PLATFORM_FEE_BPS > 0) {
-      const feeStroops = Math.floor(parseFloat(amount) * 1e7 * PLATFORM_FEE_BPS / 10000);
+    if (asset === "USDC" && fee_breakdown.platform_fee_bps > 0) {
+      const feeStroops = Math.floor(parseFloat(amount) * 1e7 * fee_breakdown.platform_fee_bps / 10000);
       if (feeStroops > 0) {
         depositFee(feeStroops).catch((err) =>
           logger.warn("Fee deposit failed (non-critical):", { error: err.message }),
@@ -365,6 +452,24 @@ async function send(req, res, next) {
       .then(({ rows }) => rows[0] && sendTransactionEmail(rows[0].email, "received", emailTxData))
       .catch(() => {});
 
+    // Persist in-app notifications
+    persistAndBroadcast(req.user.userId, 'payment_sent', 'Payment Sent',
+      `You sent ${amount} ${asset} to ${recipient_address}`,
+      emailTxData
+    ).catch(() => {});
+
+    db.query(
+      "SELECT u.user_id FROM users u JOIN wallets w ON w.user_id = u.id WHERE w.public_key = $1 LIMIT 1",
+      [recipient_address],
+    ).then(({ rows }) => {
+      if (rows[0]) {
+        persistAndBroadcast(rows[0].user_id, 'payment_received', 'Payment Received',
+          `You received ${amount} ${asset}`,
+          emailTxData
+        ).catch(() => {});
+      }
+    }).catch(() => {});
+
     res.json({
       message: type === "claimable_balance" ? "Claimable balance created" : "Payment sent successfully",
       transaction: {
@@ -376,6 +481,7 @@ async function send(req, res, next) {
         recipient: recipient_address,
         type,
         claimableBalanceId,
+        fee_breakdown,
       },
     });
   } catch (err) {
@@ -384,6 +490,7 @@ async function send(req, res, next) {
     if (err.status === 400 || err.status === 500) {
       webhook.deliver('payment.failed', { error: err.message }).catch(() => {});
       return res.status(err.status).json({ error: err.message });
+    }
     // Issue #243: Insert a failed transaction record when sendPayment throws
     // and the sender wallet is known, to maintain a full audit trail.
     if (public_key) {
@@ -610,7 +717,7 @@ async function history(req, res, next) {
     }
     const whereClause = conditions.join(" AND ");
 
-    const listSql = `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, created_at, ledger_close_time
+    const listSql = `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, created_at, ledger_close_time, fee_breakdown
          FROM transactions
          WHERE ${whereClause}
          ORDER BY id DESC LIMIT $${baseParams.length + 1}`;
@@ -675,8 +782,13 @@ async function sendPath(req, res, next) {
       if (!phoneVerified) {
         return res.status(403).json({ error: `Phone verification required for transactions above $${PHONE_VERIFICATION_THRESHOLD_USD} USD equivalent.`, phone_verified: false, code: "PHONE_VERIFICATION_REQUIRED" });
       }
-      if (kycStatus !== "verified" && estimatedUSD >= KYC_THRESHOLD_USD) {
-        return res.status(403).json({ error: `KYC verification required for transactions above $${KYC_THRESHOLD_USD} USD equivalent.`, kyc_status: kycStatus, code: "KYC_REQUIRED" });
+      if (estimatedUSD >= KYC_THRESHOLD_USD) {
+        if (kycStatus === "expired") {
+          return res.status(403).json({ error: "Your identity document has expired. Please re-verify to continue.", kyc_status: kycStatus, code: "KYC_EXPIRED" });
+        }
+        if (kycStatus !== "verified") {
+          return res.status(403).json({ error: `KYC verification required for transactions above $${KYC_THRESHOLD_USD} USD equivalent.`, kyc_status: kycStatus, code: "KYC_REQUIRED" });
+        }
       }
     }
 
@@ -778,8 +890,13 @@ async function sendStrictReceivePath(req, res, next) {
       if (!phoneVerified) {
         return res.status(403).json({ error: `Phone verification required for transactions above $${PHONE_VERIFICATION_THRESHOLD_USD} USD equivalent.`, phone_verified: false, code: "PHONE_VERIFICATION_REQUIRED" });
       }
-      if (kycStatus !== "verified" && estimatedUSD >= KYC_THRESHOLD_USD) {
-        return res.status(403).json({ error: `KYC verification required for transactions above ${KYC_THRESHOLD_USD} USD equivalent.`, kyc_status: kycStatus, code: "KYC_REQUIRED" });
+      if (estimatedUSD >= KYC_THRESHOLD_USD) {
+        if (kycStatus === "expired") {
+          return res.status(403).json({ error: "Your identity document has expired. Please re-verify to continue.", kyc_status: kycStatus, code: "KYC_EXPIRED" });
+        }
+        if (kycStatus !== "verified") {
+          return res.status(403).json({ error: `KYC verification required for transactions above ${KYC_THRESHOLD_USD} USD equivalent.`, kyc_status: kycStatus, code: "KYC_REQUIRED" });
+        }
       }
     }
 
@@ -865,7 +982,15 @@ async function pollTransactionConfirmation(txId, txHash) {
   await db.query(`UPDATE transactions SET status = 'failed', confirmed_at = NOW() WHERE id = $1`, [txId]);
 }
 
+const EXPORT_ROW_LIMIT = parseInt(process.env.EXPORT_ROW_LIMIT || "1000000", 10);
+const EXPORT_BATCH_SIZE = 500;
+
 async function exportCSV(req, res, next) {
+  const walletResult = await db.query(
+    "SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
+    [req.user.userId],
+  ).catch(() => null);
+  let client;
   try {
     const walletResult = await db.query(
       "SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
@@ -873,13 +998,39 @@ async function exportCSV(req, res, next) {
     );
     if (!walletResult.rows[0]) return res.status(404).json({ error: "Wallet not found" });
 
-    const { public_key } = walletResult.rows[0];
+  if (!walletResult?.rows[0]) return res.status(404).json({ error: "Wallet not found" });
+  const { public_key } = walletResult.rows[0];
 
-    const ALLOWED_STATUSES = ["pending", "completed", "cancelled", "failed"];
-    if (req.query.status && !ALLOWED_STATUSES.includes(req.query.status)) {
-      return res.status(400).json({ error: `Invalid status value. Must be one of: ${ALLOWED_STATUSES.join(", ")}` });
-    }
+  const ALLOWED_STATUSES = ["pending", "completed", "cancelled", "failed"];
+  if (req.query.status && !ALLOWED_STATUSES.includes(req.query.status)) {
+    return res.status(400).json({ error: `Invalid status value. Must be one of: ${ALLOWED_STATUSES.join(", ")}` });
+  }
 
+  const sanitize = (s) => s.replace(/[^0-9a-zA-Z_\-]/g, "");
+  let filename;
+  if (req.query.from || req.query.to) {
+    const from = sanitize((req.query.from || "").slice(0, 10));
+    const to = sanitize((req.query.to || "").slice(0, 10));
+    filename = `transactions_${from}_to_${to}.csv`;
+  } else {
+    const today = new Date().toISOString().slice(0, 10);
+    filename = `transactions_exported_${today}.csv`;
+  }
+
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+  const stringifier = csvStream({
+    header: true,
+    columns: ["date", "direction", "amount", "asset", "recipient_or_sender", "memo", "tx_hash", "status"],
+  });
+  stringifier.pipe(res);
+
+  const client = await db.pool.connect();
+  let rowCount = 0;
+  let streamErrored = false;
+
+  try {
     const params = [public_key];
     let filters = "";
     if (req.query.from) { params.push(req.query.from); filters += ` AND created_at >= $${params.length}`; }
@@ -888,27 +1039,59 @@ async function exportCSV(req, res, next) {
     if (req.query.direction === "sent") filters += " AND sender_wallet = $1";
     else if (req.query.direction === "received") filters += " AND recipient_wallet = $1";
 
-    const result = await db.query(
-      `SELECT created_at, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status
+    await client.query("BEGIN");
+    await client.query(
+      `DECLARE txexport CURSOR FOR
+       SELECT created_at, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status
        FROM transactions
        WHERE (sender_wallet = $1 OR recipient_wallet = $1)${filters}
-       ORDER BY created_at DESC`,
+       ORDER BY created_at DESC
+       LIMIT ${EXPORT_ROW_LIMIT}`,
       params,
     );
 
-    const rows = result.rows.map((tx) => ({
-      date: new Date(tx.created_at).toISOString(),
-      direction: tx.sender_wallet === public_key ? "sent" : "received",
-      amount: tx.amount,
-      asset: tx.asset,
-      recipient_or_sender: tx.sender_wallet === public_key ? tx.recipient_wallet : tx.sender_wallet,
-      memo: tx.memo || "",
-      tx_hash: tx.tx_hash || "",
-      status: tx.status,
-    }));
+    while (true) {
+      const batch = await client.query(`FETCH ${EXPORT_BATCH_SIZE} FROM txexport`);
+      if (batch.rows.length === 0) break;
 
-    res.setHeader("Content-Type", "text/csv");
-    // Build dynamic filename based on date range params; sanitize to prevent header injection
+      for (const tx of batch.rows) {
+        stringifier.write({
+          date: new Date(tx.created_at).toISOString(),
+          direction: tx.sender_wallet === public_key ? "sent" : "received",
+          amount: tx.amount,
+          asset: tx.asset,
+          recipient_or_sender: tx.sender_wallet === public_key ? tx.recipient_wallet : tx.sender_wallet,
+          memo: tx.memo || "",
+          tx_hash: tx.tx_hash || "",
+          status: tx.status,
+        });
+      }
+
+      rowCount += batch.rows.length;
+      if (rowCount >= EXPORT_ROW_LIMIT) break;
+    }
+
+    await client.query("CLOSE txexport");
+    await client.query("COMMIT");
+  } catch (err) {
+    streamErrored = true;
+    logger.error("CSV export cursor error", { error: err.message });
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    // Append an error sentinel row so the client knows the export was interrupted
+    stringifier.write({
+      date: new Date().toISOString(),
+      direction: "ERROR",
+      amount: "",
+      asset: "",
+      recipient_or_sender: "",
+      memo: "ERROR: Export interrupted. Please retry.",
+      tx_hash: "",
+      status: "error",
+    });
+  } finally {
+    client.release();
+    stringifier.end();
+    // Build filename before streaming starts
     const sanitize = (s) => s.replace(/[^0-9a-zA-Z_\-]/g, "");
     let filename;
     if (req.query.from || req.query.to) {
@@ -919,16 +1102,236 @@ async function exportCSV(req, res, next) {
       const today = new Date().toISOString().slice(0, 10);
       filename = `transactions_exported_${today}.csv`;
     }
+
+    res.setHeader("Content-Type", "text/csv");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
-    const output = stringify(rows, {
+    // Use a dedicated client for the cursor so we can keep it open across fetches
+    client = await db.pool.connect();
+    const cursorName = `export_cursor_${Date.now()}`;
+    await client.query("BEGIN");
+    await client.query(
+      `DECLARE ${cursorName} CURSOR FOR
+       SELECT created_at, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status
+       FROM transactions
+       WHERE (sender_wallet = $1 OR recipient_wallet = $1)${filters}
+       ORDER BY created_at DESC`,
+      params,
+    );
+
+    const csvStream = stringifyStream({
       header: true,
       columns: ["date", "direction", "amount", "asset", "recipient_or_sender", "memo", "tx_hash", "status"],
     });
-    res.send(output);
+
+    csvStream.pipe(res);
+
+    const BATCH = 500;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const { rows } = await client.query(`FETCH ${BATCH} FROM ${cursorName}`);
+      if (rows.length === 0) break;
+      for (const tx of rows) {
+        const ok = csvStream.write({
+          date: new Date(tx.created_at).toISOString(),
+          direction: tx.sender_wallet === public_key ? "sent" : "received",
+          amount: tx.amount,
+          asset: tx.asset,
+          recipient_or_sender: tx.sender_wallet === public_key ? tx.recipient_wallet : tx.sender_wallet,
+          memo: tx.memo || "",
+          tx_hash: tx.tx_hash || "",
+          status: tx.status,
+        });
+        // Respect backpressure
+        if (!ok) await new Promise((resolve) => csvStream.once("drain", resolve));
+      }
+    }
+
+    csvStream.end();
+    await client.query("CLOSE " + cursorName);
+    await client.query("COMMIT");
+    client.release();
+    client = null;
+  } catch (err) {
+    if (client) {
+      try { await client.query("ROLLBACK"); } catch (_) {}
+      client.release();
+    }
+    // Headers may already be sent if streaming started; just destroy the connection
+    if (res.headersSent) { res.destroy(); } else { next(err); }
+  }
+}
+
+/**
+ * GET /api/payments/:id
+ * Returns a single payment record for the authenticated user, including fee_breakdown.
+ */
+async function getPaymentById(req, res, next) {
+  try {
+    const walletResult = await db.query(
+      "SELECT public_key FROM wallets WHERE user_id = $1",
+      [req.user.userId],
+    );
+    const publicKeys = walletResult.rows.map((r) => r.public_key);
+    if (publicKeys.length === 0) return res.status(404).json({ error: "Wallet not found" });
+
+    const result = await db.query(
+      `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type,
+              tx_hash, status, created_at, ledger_close_time, fee_breakdown
+       FROM transactions
+       WHERE id = $1 AND (sender_wallet = ANY($2) OR recipient_wallet = ANY($2))`,
+      [req.params.id, publicKeys],
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Payment not found" });
+
+    const tx = result.rows[0];
+    res.json({
+      ...tx,
+      direction: publicKeys.includes(tx.sender_wallet) ? "sent" : "received",
+    });
   } catch (err) {
     next(err);
   }
 }
 
-module.exports = { send, sendBatch, history, findPath, sendPath, exportCSV, estimateFee, getFeeStats, findReceivePathHandler, sendStrictReceivePath };
+/**
+ * POST /api/payments/:id/cancel
+ *
+ * Cancel a pending escrow payment and trigger the on-chain Soroban cancel_escrow
+ * function to release funds back to the sender.
+ *
+ * Acceptance criteria:
+ *  - status must be 'pending' and expires_at < NOW() (48-hour lock elapsed).
+ *  - Returns 403 CANCEL_TOO_EARLY if the window has not elapsed.
+ *  - Calls Soroban cancel_escrow(escrow_id), signed by the backend service account.
+ *  - DB is updated to status:'cancelled', cancelled_at:NOW() ONLY after on-chain confirmation.
+ *  - If on-chain fails, DB is NOT updated.
+ *  - Sender is notified via email.
+ *  - Event is written to the audit log.
+ */
+async function cancelPendingEscrow(req, res, next) {
+  try {
+    const { id } = req.params;
+
+    // 1. Load the escrow record from agent_escrows
+    const escrowResult = await db.query(
+      "SELECT * FROM agent_escrows WHERE id = $1",
+      [id]
+    );
+    if (!escrowResult.rows[0]) {
+      return res.status(404).json({ error: "Escrow not found" });
+    }
+    const escrow = escrowResult.rows[0];
+
+    // 2. Validate status
+    if (escrow.status !== "pending") {
+      return res.status(400).json({ error: "Only pending escrows can be cancelled" });
+    }
+
+    // 3. Verify the caller is the sender
+    const walletResult = await db.query(
+      "SELECT public_key, encrypted_secret_key FROM wallets WHERE user_id = $1",
+      [req.user.userId]
+    );
+    if (!walletResult.rows[0]) {
+      return res.status(404).json({ error: "Wallet not found" });
+    }
+    const { public_key, encrypted_secret_key } = walletResult.rows[0];
+
+    if (escrow.sender_wallet !== public_key) {
+      return res.status(403).json({ error: "Only the sender can cancel this escrow" });
+    }
+
+    // 4. Enforce 48-hour cancellation window: expires_at must be in the past
+    //    If expires_at is null, fall back to created_at + 48h
+    const expiresAt = escrow.expires_at
+      ? new Date(escrow.expires_at)
+      : new Date(new Date(escrow.created_at).getTime() + 48 * 60 * 60 * 1000);
+
+    const now = new Date();
+    if (now < expiresAt) {
+      return res.status(403).json({
+        error: "CANCEL_TOO_EARLY",
+        message: "You cannot cancel this payment until 48 hours after creation.",
+        cancel_available_at: expiresAt.toISOString(),
+      });
+    }
+
+    // 5. Call Soroban cancel_escrow on-chain — DB is NOT updated if this fails
+    let cancelTxHash;
+    try {
+      ({ txHash: cancelTxHash } = await cancelEscrow({
+        encryptedSecretKey: encrypted_secret_key,
+        escrowId: escrow.contract_escrow_id,
+      }));
+    } catch (stellarErr) {
+      logger.error("On-chain cancel_escrow failed", {
+        escrowId: escrow.contract_escrow_id,
+        error: stellarErr.message,
+      });
+      return res.status(502).json({
+        error: "On-chain cancellation failed. DB record has NOT been updated.",
+        detail: stellarErr.message,
+      });
+    }
+
+    // 6. On-chain confirmed — now update the database record
+    await db.query(
+      "UPDATE agent_escrows SET status = 'cancelled', cancelled_at = NOW(), confirm_tx_hash = $1 WHERE id = $2",
+      [cancelTxHash, id]
+    );
+
+    // 7. Notify sender via email (fire-and-forget)
+    db.query(
+      "SELECT u.email, u.full_name FROM users u JOIN wallets w ON w.user_id = u.id WHERE w.public_key = $1 LIMIT 1",
+      [escrow.sender_wallet]
+    )
+      .then(({ rows }) => {
+        if (!rows[0]) return;
+        const { email, full_name } = rows[0];
+        enqueueEmail({
+          to: email,
+          subject: "AfriPay: Your payment has been cancelled and refunded",
+          html: `<p>Hi ${full_name},</p>
+<p>Your payment of <strong>${escrow.amount} ${escrow.asset}</strong> has been cancelled and the funds have been refunded to your wallet.</p>
+<p>Transaction Hash: <code>${cancelTxHash}</code></p>
+<p><a href="${process.env.FRONTEND_URL}/history">View in AfriPay</a></p>`,
+        }).catch(() => {});
+      })
+      .catch(() => {});
+
+    // 8. Write cancellation event to audit log
+    await audit.auditLog(req, "escrow_cancelled", {
+      type: "agent_escrow",
+      id,
+      newValue: {
+        escrow_id: id,
+        contract_escrow_id: escrow.contract_escrow_id,
+        stellar_tx_hash: cancelTxHash,
+        cancelled_at: new Date().toISOString(),
+      },
+    });
+
+    // 9. Fire webhook event (non-blocking)
+    webhook.deliver("escrow.cancelled", {
+      escrow_id: id,
+      contract_escrow_id: escrow.contract_escrow_id,
+      tx_hash: cancelTxHash,
+      amount: escrow.amount,
+      asset: escrow.asset,
+      sender: escrow.sender_wallet,
+    }).catch(() => {});
+
+    return res.json({
+      message: "Escrow cancelled and funds refunded to your wallet",
+      escrow_id: id,
+      contract_escrow_id: escrow.contract_escrow_id,
+      tx_hash: cancelTxHash,
+      status: "cancelled",
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { send, sendBatch, history, findPath, sendPath, exportCSV, estimateFee, estimateFees, getFeeStats, getFeeRate, findReceivePathHandler, sendStrictReceivePath, getPaymentById, cancelPendingEscrow };

@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const { body, validationResult } = require('express-validator');
-const { register, login, verifyEmail, getMe, setPIN, verifyPIN } = require('../controllers/authController');
+const multer = require('multer');
 const {
   register,
   login,
@@ -8,15 +8,23 @@ const {
   logout,
   verifyEmail,
   verifyPhone,
+  getMe,
   updateProfile,
   changeEmail,
   verifyEmailChange,
   getActivity,
+  uploadAvatar,
+  setPIN,
+  verifyPIN,
   setup2FA,
   verify2FA,
   disable2FA,
   forgotPassword,
   resetPassword,
+  regenerateBackupCodes,
+  getBackupCodeCount,
+  changePassword,
+  validateResetToken,
 } = require('../controllers/authController');
 const authMiddleware = require('../middleware/auth');
 const geoRestriction = require('../middleware/geoRestriction');
@@ -89,6 +97,8 @@ router.post(
   resetPassword
 );
 
+router.get('/reset-password/validate', validateResetToken);
+
 router.post('/refresh', verifyCsrf, refresh);
 router.post('/logout', verifyCsrf, logout);
 
@@ -147,6 +157,44 @@ router.post(
   [body('password').notEmpty().withMessage('Password is required')],
   validate,
   disable2FA
+);
+
+router.post(
+  '/2fa/backup-codes/regenerate',
+  authMiddleware,
+  [body('totp_code').matches(/^\d{6}$/).withMessage('TOTP code must be 6 digits')],
+  validate,
+  regenerateBackupCodes
+);
+
+router.get('/2fa/backup-codes/count', authMiddleware, getBackupCodeCount);
+
+const { listSessions, revokeSession, revokeAllSessions } = require('../controllers/sessionController');
+// Avatar upload — 5 MB limit, memory storage (magic bytes checked in controller)
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/^image\/(jpeg|png|webp)$/.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only JPEG, PNG, and WebP files are allowed'));
+  },
+});
+
+// Change password — invalidates all other active sessions
+router.patch(
+  '/password',
+  authMiddleware,
+  [
+    body('current_password').notEmpty().withMessage('Current password is required'),
+    body('new_password').isLength({ min: 8 }).withMessage('New password must be at least 8 characters'),
+  ],
+  validate,
+  changePassword
+router.post(
+  '/avatar',
+  authMiddleware,
+  avatarUpload.single('avatar'),
+  uploadAvatar
 );
 
 // Session management

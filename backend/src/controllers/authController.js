@@ -6,6 +6,8 @@ const { createWallet, encryptPrivateKey, addTrustline } = require('../services/s
 const audit = require('../services/audit');
 const logger = require('../utils/logger');
 const { hashPIN, comparePIN, validatePIN } = require('../services/pin');
+const { sendVerificationEmail, sendPasswordResetEmail, sendBackupCodeWarningEmail } = require('../services/email');
+const { generateSecret, verifyToken, generateBackupCodes, useBackupCode, hashBackupCode, verifyBackupCode } = require('../services/twofa');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email');
 const { generateSecret, verifyToken, generateBackupCodes } = require('../services/twofa');
 const {
@@ -14,10 +16,14 @@ const {
   signAccessToken,
   generateRefreshToken,
   refreshTokenExpiresAt,
+  signDeviceToken,
+  verifyDeviceToken,
 } = require('../utils/tokens');
 const { setCsrfCookie } = require('../middleware/csrf');
+const cache = require('../utils/cache');
 
 const { sendOTP } = require('../services/sms');
+const { recordSession, invalidateOtherSessions } = require('./sessionController');
 const { recordSession } = require('./sessionController');
 
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
@@ -163,7 +169,8 @@ async function register(req, res, next) {
 
 async function login(req, res, next) {
   try {
-    const { email, password, totp_code } = req.body;
+    const { email, password, totp_code, rememberDevice } = req.body;
+    const incomingDeviceToken = req.headers['x-device-token'];
 
     const result = await db.query(
       `SELECT u.id, u.full_name, u.email, u.password_hash, u.email_verified, u.role,
@@ -245,15 +252,58 @@ async function login(req, res, next) {
       return res.status(403).json({ error: 'Please verify your email before logging in.' });
     }
 
-    // Short-lived access token
-    // 2FA check — must happen before issuing tokens
+    // Check if 2FA is enabled
     if (user.totp_enabled) {
-      if (!totp_code) {
+      const { totp_code: totpCode, backup_code } = req.body;
+      if (!totpCode && !backup_code) {
         return res.status(403).json({ error: 'TOTP code required', requires_2fa: true });
       }
-      const isValid = verifyToken(user.totp_secret, totp_code);
-      if (!isValid) {
-        return res.status(401).json({ error: 'Invalid TOTP code' });
+
+      if (backup_code) {
+        const codes = await db.query(
+          `SELECT id, code_hash FROM totp_backup_codes WHERE user_id = $1 AND used_at IS NULL`,
+          [user.id]
+        );
+        let matchedId = null;
+        for (const row of codes.rows) {
+          if (await verifyBackupCode(backup_code, row.code_hash)) {
+            matchedId = row.id;
+            break;
+          }
+        }
+        if (!matchedId) {
+          return res.status(401).json({ error: 'BACKUP_CODE_USED' });
+        }
+        await db.query(`UPDATE totp_backup_codes SET used_at = NOW() WHERE id = $1`, [matchedId]);
+        const remaining = await db.query(
+          `SELECT COUNT(*) AS count FROM totp_backup_codes WHERE user_id = $1 AND used_at IS NULL`,
+          [user.id]
+        );
+        if (parseInt(remaining.rows[0].count, 10) < 3) {
+          const emailRow = await db.query('SELECT email FROM users WHERE id = $1', [user.id]);
+          sendBackupCodeWarningEmail(emailRow.rows[0].email, parseInt(remaining.rows[0].count, 10)).catch(() => {});
+        }
+      } else {
+        if (!verifyToken(user.totp_secret, totpCode)) {
+    // 2FA check — must happen before issuing tokens
+    if (user.totp_enabled) {
+      // Check if the incoming device trust token allows skipping TOTP
+      let deviceTrusted = false;
+      if (incomingDeviceToken) {
+        try {
+          const payload = verifyDeviceToken(incomingDeviceToken);
+          deviceTrusted = String(payload.userId) === String(user.id);
+        } catch { /* expired or invalid — fall through to TOTP */ }
+      }
+
+      if (!deviceTrusted) {
+        if (!totp_code) {
+          return res.status(403).json({ error: 'TOTP code required', requires_2fa: true });
+        }
+        const isValid = verifyToken(user.totp_secret, totp_code);
+        if (!isValid) {
+          return res.status(401).json({ error: 'Invalid TOTP code' });
+        }
       }
     }
 
@@ -280,6 +330,8 @@ async function login(req, res, next) {
     // Record session for remote logout support
     await recordSession(user.id, token, req).catch(() => {});
 
+    const device_token = rememberDevice ? signDeviceToken({ userId: user.id }) : undefined;
+
     res.cookie(COOKIE_NAME, raw, COOKIE_OPTIONS);
     setCsrfCookie(res);
     audit.log(user.id, 'login_success', req.ip, req.headers['user-agent']);
@@ -292,6 +344,7 @@ async function login(req, res, next) {
         wallet_address: user.public_key,
         phone_verified: user.phone_verified,
       },
+      ...(device_token && { device_token }),
     });
   } catch (err) {
     next(err);
@@ -305,11 +358,16 @@ async function logout(req, res, next) {
       const hash = crypto.createHash('sha256').update(raw).digest('hex');
       // Delete the whole family so all sessions on this device are cleared
       const found = await db.query(
-        'SELECT family_id FROM refresh_tokens WHERE token_hash = $1',
+        'SELECT family_id, expires_at FROM refresh_tokens WHERE token_hash = $1',
         [hash]
       );
       if (found.rows[0]) {
         await db.query('DELETE FROM refresh_tokens WHERE family_id = $1', [found.rows[0].family_id]);
+        // Blacklist in Redis so in-flight refresh attempts are rejected immediately
+        const ttlSeconds = Math.max(0, Math.floor((new Date(found.rows[0].expires_at) - Date.now()) / 1000));
+        if (ttlSeconds > 0) {
+          await cache.set(`blacklist:rt:${hash}`, '1', ttlSeconds);
+        }
       }
     }
     res.clearCookie(COOKIE_NAME, { ...COOKIE_OPTIONS, maxAge: undefined });
@@ -386,7 +444,7 @@ async function verifyPhone(req, res, next) {
 async function getMe(req, res, next) {
   try {
     const result = await db.query(
-      `SELECT u.id, u.full_name, u.email, u.email_verified, u.phone, u.phone_verified, u.pin_setup_completed, u.totp_enabled, u.account_type, w.public_key
+      `SELECT u.id, u.full_name, u.email, u.email_verified, u.phone, u.phone_verified, u.pin_setup_completed, u.totp_enabled, u.account_type, u.avatar_url, w.public_key
        FROM users u LEFT JOIN wallets w ON w.user_id = u.id
        WHERE u.id = $1`,
       [req.user.userId]
@@ -404,6 +462,7 @@ async function getMe(req, res, next) {
       pin_setup_completed: u.pin_setup_completed,
       totp_enabled: u.totp_enabled,
       account_type: u.account_type,
+      avatar_url: u.avatar_url || null,
     });
   } catch (err) {
     next(err);
@@ -416,7 +475,7 @@ async function setup2FA(req, res, next) {
     const user = await db.query('SELECT email FROM users WHERE id = $1', [userId]);
     if (!user.rows[0]) return res.status(404).json({ error: 'User not found' });
 
-    const { secret, qrCode } = await generateSecret(user.rows[0].email);
+    const { secret, qrCode, otpauthUri } = await generateSecret(user.rows[0].email);
     const backupCodes = generateBackupCodes();
 
     // Store temporarily (not enabled yet)
@@ -425,7 +484,7 @@ async function setup2FA(req, res, next) {
       [secret, backupCodes, userId]
     );
 
-    res.json({ qrCode, backupCodes, secret });
+    res.json({ qrCode, backupCodes, secret, otpauthUri });
   } catch (err) {
     next(err);
   }
@@ -446,13 +505,63 @@ async function verify2FA(req, res, next) {
       return res.status(401).json({ error: 'Invalid TOTP code' });
     }
 
-    await db.query(
-      `UPDATE users SET totp_enabled = TRUE WHERE id = $1`,
-      [userId]
-    );
+    await db.query(`UPDATE users SET totp_enabled = TRUE WHERE id = $1`, [userId]);
+
+    const rawCodes = generateBackupCodes(10);
+    await db.query(`DELETE FROM totp_backup_codes WHERE user_id = $1`, [userId]);
+    for (const code of rawCodes) {
+      const hash = await hashBackupCode(code);
+      await db.query(
+        `INSERT INTO totp_backup_codes (user_id, code_hash) VALUES ($1, $2)`,
+        [userId, hash]
+      );
+    }
 
     audit.log(userId, '2fa_enabled', req.ip, req.headers['user-agent']);
-    res.json({ message: '2FA enabled successfully' });
+    res.json({ message: '2FA enabled successfully', backup_codes: rawCodes });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function regenerateBackupCodes(req, res, next) {
+  try {
+    const { totp_code } = req.body;
+    const userId = req.user.userId;
+
+    const user = await db.query('SELECT totp_secret, totp_enabled FROM users WHERE id = $1', [userId]);
+    if (!user.rows[0]?.totp_enabled) {
+      return res.status(400).json({ error: '2FA is not enabled' });
+    }
+    if (!verifyToken(user.rows[0].totp_secret, totp_code)) {
+      return res.status(401).json({ error: 'Invalid TOTP code' });
+    }
+
+    const rawCodes = generateBackupCodes(10);
+    await db.query(`DELETE FROM totp_backup_codes WHERE user_id = $1`, [userId]);
+    for (const code of rawCodes) {
+      const hash = await hashBackupCode(code);
+      await db.query(
+        `INSERT INTO totp_backup_codes (user_id, code_hash) VALUES ($1, $2)`,
+        [userId, hash]
+      );
+    }
+
+    audit.log(userId, '2fa_backup_codes_regenerated', req.ip, req.headers['user-agent']);
+    res.json({ backup_codes: rawCodes });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getBackupCodeCount(req, res, next) {
+  try {
+    const userId = req.user.userId;
+    const result = await db.query(
+      `SELECT COUNT(*) AS count FROM totp_backup_codes WHERE user_id = $1 AND used_at IS NULL`,
+      [userId]
+    );
+    res.json({ remaining: parseInt(result.rows[0].count, 10) });
   } catch (err) {
     next(err);
   }
@@ -535,6 +644,14 @@ async function refresh(req, res, next) {
 
     const hash = crypto.createHash('sha256').update(raw).digest('hex');
 
+    // Fast-path: check Redis blacklist before hitting the database
+    const blacklisted = await cache.get(`blacklist:rt:${hash}`);
+    if (blacklisted) {
+      logger.warn('refresh_token_blacklisted — Redis fast-reject', { event: 'refresh_token_blacklisted' });
+      res.clearCookie(COOKIE_NAME, { ...COOKIE_OPTIONS, maxAge: undefined });
+      return res.status(401).json({ error: 'Refresh token has been revoked. Please log in again.' });
+    }
+
     // Look up the token — active (not revoked) and not expired
     const result = await db.query(
       `SELECT rt.id, rt.user_id, rt.expires_at, rt.family_id, rt.revoked,
@@ -612,6 +729,12 @@ async function refresh(req, res, next) {
        VALUES ($1, $2, $3, $4, $5, FALSE)`,
       [uuidv4(), record.user_id, newHash, expiresAt, record.family_id]
     );
+
+    // Blacklist old token in Redis (TTL = remaining valid time before it would have expired)
+    const oldTtlSeconds = Math.max(0, Math.floor((new Date(record.expires_at) - Date.now()) / 1000));
+    if (oldTtlSeconds > 0) {
+      await cache.set(`blacklist:rt:${hash}`, '1', oldTtlSeconds);
+    }
 
     const token = signAccessToken({
       userId: record.user_id,
@@ -694,6 +817,30 @@ async function resetPassword(req, res, next) {
     res.json({ message: 'Password has been reset. You can now log in.' });
   } catch (err) {
     await db.query('ROLLBACK').catch(() => {});
+    next(err);
+  }
+}
+
+async function validateResetToken(req, res, next) {
+  try {
+    const { token } = req.query;
+    if (!token) {
+      return res.status(400).json({ error: 'Token is required' });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const found = await db.query(
+      `SELECT expires_at FROM password_reset_tokens
+       WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()`,
+      [tokenHash]
+    );
+
+    if (found.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid or expired reset token' });
+    }
+
+    res.json({ expires_at: found.rows[0].expires_at });
+  } catch (err) {
     next(err);
   }
 }
@@ -817,6 +964,80 @@ async function getActivity(req, res, next) {
   }
 }
 
+async function changePassword(req, res, next) {
+  try {
+    const { current_password, new_password } = req.body;
+    const userId = req.user.userId;
+
+    const { rows } = await db.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+    if (!rows[0] || !(await bcrypt.compare(current_password, rows[0].password_hash))) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    const newHash = await bcrypt.hash(new_password, 12);
+    await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, userId]);
+
+    // Invalidate all other sessions
+    const currentHash = req.headers.authorization
+      ? require('crypto').createHash('sha256').update(req.headers.authorization.replace('Bearer ', '')).digest('hex')
+      : null;
+    if (currentHash) {
+      await invalidateOtherSessions(userId, currentHash).catch(() => {});
+    }
+
+    audit.log(userId, 'password_change', req.ip, req.headers['user-agent']);
+    res.json({ message: 'Password changed successfully' });
+// Magic-bytes signatures for allowed image types
+const IMAGE_MAGIC = [
+  { mime: 'image/jpeg', bytes: [0xff, 0xd8, 0xff] },
+  { mime: 'image/png',  bytes: [0x89, 0x50, 0x4e, 0x47] },
+  { mime: 'image/webp', bytes: null, check: (b) => b[0]===0x52&&b[1]===0x49&&b[2]===0x46&&b[3]===0x46&&b[8]===0x57&&b[9]===0x45&&b[10]===0x42&&b[11]===0x50 },
+];
+
+function detectMime(buffer) {
+  for (const sig of IMAGE_MAGIC) {
+    if (sig.check) { if (buffer.length >= 12 && sig.check(buffer)) return sig.mime; }
+    else if (buffer.slice(0, sig.bytes.length).every((b, i) => b === sig.bytes[i])) return sig.mime;
+  }
+  return null;
+}
+
+async function uploadAvatar(req, res, next) {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const mime = detectMime(req.file.buffer);
+    if (!mime) {
+      return res.status(400).json({ error: 'Invalid file type. Only JPEG, PNG, and WebP are accepted.' });
+    }
+
+    const ext = mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png';
+    const filename = `${req.user.userId}_${Date.now()}.${ext}`;
+
+    const path = require('path');
+    const fs = require('fs');
+    const dir = path.join(__dirname, '../../uploads/avatars');
+    fs.mkdirSync(dir, { recursive: true });
+
+    // Delete old avatar file if it exists
+    const old = await db.query('SELECT avatar_url FROM users WHERE id = $1', [req.user.userId]);
+    const oldUrl = old.rows[0]?.avatar_url;
+    if (oldUrl) {
+      const oldFile = path.join(dir, path.basename(oldUrl));
+      fs.unlink(oldFile, () => {});
+    }
+
+    fs.writeFileSync(path.join(dir, filename), req.file.buffer);
+
+    const avatarUrl = `/uploads/avatars/${filename}`;
+    await db.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [avatarUrl, req.user.userId]);
+
+    res.json({ avatar_url: avatarUrl });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = { register, login, verifyEmail, getMe, setPIN, verifyPIN };
 module.exports = {
   register,
@@ -830,6 +1051,7 @@ module.exports = {
   changeEmail,
   verifyEmailChange,
   getActivity,
+  uploadAvatar,
   setPIN,
   verifyPIN,
   setup2FA,
@@ -837,4 +1059,8 @@ module.exports = {
   disable2FA,
   forgotPassword,
   resetPassword,
+  regenerateBackupCodes,
+  getBackupCodeCount,
+  changePassword,
+  validateResetToken,
 };

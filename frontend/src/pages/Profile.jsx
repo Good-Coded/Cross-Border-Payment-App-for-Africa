@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import { useNavigate, Link } from 'react-router-dom';
+import toast from 'react-hot-toast';
+import { useTranslation } from 'react-i18next';
 import {
   LogOut,
-  User,
   Mail,
   Phone,
   Wallet,
@@ -26,12 +28,12 @@ import {
   Link2,
   Calendar,
   Webhook,
+  Camera,
 } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
+import { useAuth, tokenStore } from '../context/AuthContext';
 import { truncateAddress } from '../utils/currency';
 import api from '../utils/api';
-import toast from 'react-hot-toast';
-import { useTranslation } from 'react-i18next';
+import AvatarCrop from '../components/AvatarCrop';
 
 const LANGUAGES = [
   { code: 'en', label: 'English' },
@@ -46,6 +48,32 @@ export default function Profile() {
   const navigate = useNavigate();
   const { t, i18n } = useTranslation();
   const [copied, setCopied] = useState(false);
+
+  // Avatar upload state
+  const fileInputRef = useRef(null);
+  const [cropFile, setCropFile] = useState(null); // File selected for cropping
+
+  const handleAvatarClick = () => fileInputRef.current?.click();
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error('File too large. Maximum size is 5 MB.');
+      return;
+    }
+    if (!/^image\/(jpeg|jpg|png|webp)$/.test(file.type)) {
+      toast.error('Only JPEG, PNG, and WebP files are accepted.');
+      return;
+    }
+    setCropFile(file);
+    // Reset input so same file can be selected again
+    e.target.value = '';
+  };
+  const handleCropSuccess = (avatarUrl) => {
+    updateUser({ avatar_url: avatarUrl });
+    setCropFile(null);
+    toast.success('Profile photo updated');
+  };
   const [contacts, setContacts] = useState([]);
   const [contactsLoading, setContactsLoading] = useState(true);
   const [showAddContact, setShowAddContact] = useState(false);
@@ -474,9 +502,35 @@ export default function Profile() {
       {/* User info card */}
       <div className="bg-gray-900 rounded-2xl p-5 space-y-4">
         <div className="flex items-center gap-4">
-          <div className="w-14 h-14 bg-primary-500 rounded-full flex items-center justify-center text-2xl font-bold text-white">
-            {user?.full_name?.[0]?.toUpperCase()}
-          </div>
+          {/* Avatar — clickable to upload a new photo */}
+          <button
+            type="button"
+            onClick={handleAvatarClick}
+            className="relative w-14 h-14 rounded-full overflow-hidden bg-primary-500 flex items-center justify-center text-2xl font-bold text-white shrink-0 group"
+            aria-label="Change profile photo"
+          >
+            {user?.avatar_url ? (
+              <img
+                src={user.avatar_url}
+                alt="Profile"
+                className="w-full h-full object-cover"
+              />
+            ) : (
+              <span>{user?.full_name?.[0]?.toUpperCase()}</span>
+            )}
+            {/* Camera overlay on hover */}
+            <span className="absolute inset-0 bg-black/50 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+              <Camera size={18} className="text-white" />
+            </span>
+          </button>
+          {/* Hidden file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".jpg,.jpeg,.png,.webp"
+            className="hidden"
+            onChange={handleFileChange}
+          />
           <div>
             <p className="font-semibold text-white text-lg">{user?.full_name}</p>
             <p className="text-gray-400 text-sm">{t('profile.member')}</p>
@@ -1214,7 +1268,20 @@ export default function Profile() {
               <p className="text-sm text-gray-300 text-center">
                 Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.)
               </p>
-              <img src={twoFAData.qrCode} alt="2FA QR Code" className="w-44 h-44 rounded-lg" />
+              <div className="bg-white p-2 rounded-lg">
+                <QRCodeSVG
+                  value={twoFAData.otpauthUri || twoFAData.qrCode}
+                  size={176}
+                />
+              </div>
+              {twoFAData.secret && (
+                <div className="w-full text-center">
+                  <p className="text-xs text-gray-400 mb-1">Or enter this key manually:</p>
+                  <p className="font-mono text-xs text-white bg-gray-900 px-3 py-2 rounded-lg break-all tracking-widest select-all">
+                    {twoFAData.secret}
+                  </p>
+                </div>
+              )}
             </div>
 
             <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4">
@@ -1437,6 +1504,43 @@ export default function Profile() {
         </div>
       </div>
 
+      {/* Notification Preferences */}
+      {'serviceWorker' in navigator && 'PushManager' in window && (() => {
+        const PREFS_KEY = 'afripay_notification_prefs';
+        const defaultPrefs = { payment_confirmed: true, payment_received: true, kyc_approved: true };
+        let prefs;
+        try { prefs = { ...defaultPrefs, ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') }; }
+        catch { prefs = defaultPrefs; }
+        const savePrefs = (key, value) => {
+          const updated = { ...prefs, [key]: value };
+          localStorage.setItem(PREFS_KEY, JSON.stringify(updated));
+        };
+        const NotifToggle = ({ label, prefKey }) => {
+          const [on, setOn] = React.useState(prefs[prefKey]);
+          return (
+            <div className="flex items-center justify-between py-2">
+              <span className="text-sm text-gray-300">{label}</span>
+              <button
+                role="switch"
+                aria-checked={on}
+                onClick={() => { const next = !on; setOn(next); savePrefs(prefKey, next); }}
+                className={`relative w-10 h-6 rounded-full transition-colors ${on ? 'bg-primary-600' : 'bg-gray-700'}`}
+              >
+                <span className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${on ? 'translate-x-5' : 'translate-x-1'}`} />
+              </button>
+            </div>
+          );
+        };
+        return (
+          <div className="bg-gray-900 rounded-2xl p-5">
+            <h3 className="font-semibold text-white mb-3">Notification Preferences</h3>
+            <NotifToggle label="Payment confirmed" prefKey="payment_confirmed" />
+            <NotifToggle label="Payment received" prefKey="payment_received" />
+            <NotifToggle label="KYC approved" prefKey="kyc_approved" />
+          </div>
+        );
+      })()}
+
       {/* Close Account */}
       <div className="bg-gray-900 rounded-2xl p-5">
         <div className="flex items-center justify-between mb-1">
@@ -1498,6 +1602,16 @@ export default function Profile() {
       >
         <LogOut size={18} /> {t('common.sign_out')}
       </button>
+      {/* Avatar crop modal */}
+      {cropFile && (
+        <AvatarCrop
+          file={cropFile}
+          onSuccess={handleCropSuccess}
+          onClose={() => setCropFile(null)}
+          apiBase={process.env.REACT_APP_API_URL || 'http://localhost:5000/api'}
+          token={tokenStore.get()}
+        />
+      )}
       {/* Delete contact confirmation dialog */}
       {deleteContactPending && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
