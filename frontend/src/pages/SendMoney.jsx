@@ -1,8 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo, useReducer, useRef } from 'react';
-import { useNavigate, useSearchParams, useBeforeUnload } from 'react-router-dom';
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { useMemoValidation } from '../hooks/useMemoValidation';
 import { useNavigate, useSearchParams, useBeforeUnload, Link } from 'react-router-dom';
+import { useMemoValidation } from '../hooks/useMemoValidation';
 import {
   ArrowLeft,
   Send,
