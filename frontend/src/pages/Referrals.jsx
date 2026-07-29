@@ -23,11 +23,15 @@ export default function Referrals() {
   const webLink = code ? `${window.location.origin}/register?ref=${code}` : '';
   const deepLink = code ? `${DEEP_LINK_PREFIX}?ref=${code}` : '';
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(webLink);
-    setCopied(true);
-    toast.success('Referral link copied!');
-    setTimeout(() => setCopied(false), 2000);
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(webLink);
+      setCopied(true);
+      toast.success('Referral link copied!');
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error('Failed to copy referral link');
+    }
   };
 
   const handleShare = async () => {
