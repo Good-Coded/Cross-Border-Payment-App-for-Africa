@@ -1,11 +1,11 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, TrendingUp, Download, FileText, Loader2 } from 'lucide-react';
 import api from '../utils/api';
 import { useAuth } from '../context/AuthContext';
 import { useTranslation } from 'react-i18next';
 import toast from 'react-hot-toast';
-import { tokenStore } from '../context/AuthContext';
+
 
 function toDateInput(d) {
   return d.toISOString().slice(0, 10);
@@ -28,20 +28,34 @@ export default function Analytics() {
   const [loading, setLoading] = useState(true);
   const [csvLoading, setCsvLoading] = useState(false);
   const [pdfLoading, setPdfLoading] = useState(false);
+  const abortRef = useRef(null);
 
   const fetchAnalytics = useCallback(async () => {
+    // Cancel any in-flight request to prevent stale responses overwriting newer ones
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     try {
-      const res = await api.get(`/payments/analytics?from=${range.from}&to=${range.to}`);
+      const res = await api.get(`/payments/analytics?from=${range.from}&to=${range.to}`, {
+        signal: controller.signal,
+      });
       setData(res.data);
-    } catch {
+    } catch (err) {
+      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
       toast.error(t('analytics.error') || 'Failed to load analytics');
     } finally {
       setLoading(false);
     }
   }, [range.from, range.to, t]);
 
-  useEffect(() => { fetchAnalytics(); }, [fetchAnalytics]);
+  useEffect(() => {
+    fetchAnalytics();
+    return () => {
+      if (abortRef.current) abortRef.current.abort();
+    };
+  }, [fetchAnalytics]);
 
   const totalSpent = data?.asset_breakdown?.reduce((sum, item) => sum + parseFloat(item.total || 0), 0) || 0;
   const totalTransactions = data?.asset_breakdown?.reduce((sum, item) => sum + item.count, 0) || 0;
