@@ -406,6 +406,17 @@ esac
 
 if [ "$INIT_OK" = true ]; then
     echo -e "${GREEN}✓ Contract initialized. Admin: ${ADMIN_ADDRESS:-N/A}${NC}"
+
+    if [ "$TARGET_CONTRACT" = "escrow" ] && [ -n "${ADMIN_ADDRESS:-}" ]; then
+        echo -e "\n${YELLOW}Step 6a: Running escrow migration hook...${NC}"
+        $SOROBAN_CLI contract invoke \
+            --id "$CONTRACT_ID" \
+            --source "$SOROBAN_SECRET_KEY" \
+            --network "$NETWORK" \
+            -- migrate \
+            --admin "$ADMIN_ADDRESS"
+        echo -e "${GREEN}✓ Escrow migration hook executed${NC}"
+    fi
 else
     echo -e "${RED}Do not share this contract ID until initialize() has been called.${NC}"
 fi

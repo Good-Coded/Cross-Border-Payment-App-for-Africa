@@ -4,7 +4,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, 
 mod test;
 
 /// Semantic version of this contract. Bumped on every upgrade.
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 
 #[derive(Clone)]
 #[contracttype]
@@ -97,6 +97,12 @@ pub struct Upgraded {
     pub contract_version: u32,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct Migrated {
+    pub contract_version: u32,
+}
+
 #[derive(Clone, Debug)]
 #[contracttype]
 pub struct FeesWithdrawn {
@@ -154,6 +160,7 @@ pub enum DataKey {
     RetentionPeriodSecs,
     Escrow(u64),
     KycContractAddress,
+    ContractVersion,
 }
 
 const DEFAULT_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
@@ -232,6 +239,9 @@ impl EscrowContract {
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::UsdcAddress, &usdc_address);
         env.storage().persistent().set(&DataKey::EscrowCounter, &0u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractVersion, &CONTRACT_VERSION);
         env.events().publish(
             (Symbol::new(&env, "EscrowInitialized"),),
             (env.current_contract_address(), admin, usdc_address),
@@ -263,6 +273,31 @@ impl EscrowContract {
             (Symbol::new(&env, "Upgraded"),),
             Upgraded {
                 new_wasm_hash,
+                contract_version: CONTRACT_VERSION,
+            },
+        );
+    }
+
+    pub fn migrate(env: Env, admin: Address) {
+        require_admin(&env, &admin);
+
+        let current_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0);
+
+        if current_version >= CONTRACT_VERSION {
+            return;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractVersion, &CONTRACT_VERSION);
+
+        env.events().publish(
+            (Symbol::new(&env, "Migrated"),),
+            Migrated {
                 contract_version: CONTRACT_VERSION,
             },
         );
@@ -811,6 +846,13 @@ impl EscrowContract {
                 new_fee_bps,
             },
         );
+    }
+
+    pub fn get_contract_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0)
     }
 
     pub fn get_metadata(env: Env) -> (Address, Address) {
