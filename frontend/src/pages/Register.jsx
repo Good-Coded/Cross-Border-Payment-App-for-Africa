@@ -15,7 +15,6 @@ export default function Register() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPass, setShowPass] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [showPINSetup, setShowPINSetup] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [secretKey, setSecretKey] = useState('');
   const [showSecretKey, setShowSecretKey] = useState(false);
