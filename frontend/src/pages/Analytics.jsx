@@ -65,14 +65,11 @@ export default function Analytics() {
     if (noData) return;
     setCsvLoading(true);
     try {
-      const token = tokenStore.get();
-      const baseURL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
-      const url = `${baseURL}/payments/export?format=csv&from=${range.from}&to=${range.to}`;
-      const resp = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await api.get('/payments/export', {
+        params: { format: 'csv', from: range.from, to: range.to },
+        responseType: 'blob',
       });
-      if (!resp.ok) throw new Error('Export failed');
-      const blob = await resp.blob();
+      const blob = new Blob([res.data], { type: 'text/csv' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = `transactions_${range.from}_to_${range.to}.csv`;
