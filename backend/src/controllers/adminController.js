@@ -912,15 +912,62 @@ async function bulkKycUpdate(req, res, next) {
   const kycStatus = status === 'approved' ? 'verified' : 'rejected';
   const client = await db.pool.connect();
   try {
+    // Fetch users with wallets and current kyc_status before updating
+    const { rows: users } = await client.query(
+      `SELECT u.id, u.kyc_status, u.kyc_data, w.public_key
+       FROM users u LEFT JOIN wallets w ON w.user_id = u.id
+       WHERE u.id = ANY($1::uuid[])`,
+      [userIds]
+    );
+
     await client.query('BEGIN');
     await client.query(
       `UPDATE users SET kyc_status = $1, updated_at = NOW() WHERE id = ANY($2::uuid[])`,
       [kycStatus, userIds]
     );
     await client.query('COMMIT');
+
+    // Get admin wallet for on-chain operations
+    const adminWallet = await db.query(
+      "SELECT public_key FROM wallets WHERE user_id = $1",
+      [req.user.userId]
+    );
+    const adminPublicKey = adminWallet.rows[0]?.public_key;
+
+    const attestationResults = [];
+
+    for (const user of users) {
+      let txHash = null;
+      let attestationError = null;
+
+      if (status === 'approved') {
+        const idType = user.kyc_data?.id_type || 'unknown';
+        try {
+          txHash = await attestKyc(adminPublicKey, user.public_key, user.id, idType);
+        } catch (err) {
+          attestationError = err.message;
+          console.error(`On-chain attestation failed for user ${user.id}:`, err.message);
+        }
+      } else if (status === 'rejected' && user.kyc_status === 'verified') {
+        try {
+          txHash = await revokeKyc(adminPublicKey, user.public_key);
+        } catch (err) {
+          attestationError = err.message;
+          console.error(`On-chain revocation failed for user ${user.id}:`, err.message);
+        }
+      }
+
+      attestationResults.push({
+        user_id: user.id,
+        onchain_tx_hash: txHash,
+        onchain_success: !attestationError,
+        onchain_error: attestationError,
+      });
+    }
+
     await audit.log(req.user.userId, 'bulk_kyc_update', req.ip, req.headers['user-agent'],
-      { user_count: userIds.length, status: kycStatus, reason: reason || null });
-    res.json({ message: 'KYC status updated', count: userIds.length, status: kycStatus });
+      { user_count: userIds.length, status: kycStatus, reason: reason || null, attestation_results: attestationResults });
+    res.json({ message: 'KYC status updated', count: userIds.length, status: kycStatus, attestation_results: attestationResults });
   } catch (err) {
     await client.query('ROLLBACK');
     next(err);
