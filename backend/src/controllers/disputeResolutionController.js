@@ -272,7 +272,26 @@ async function getDispute(req, res, next) {
     if (!result.rows[0]) {
       return res.status(404).json({ error: "Dispute not found" });
     }
-    res.json({ dispute: result.rows[0] });
+    const dispute = result.rows[0];
+
+    if (req.user.role !== "admin") {
+      const walletResult = await db.query(
+        "SELECT public_key FROM wallets WHERE user_id = $1",
+        [req.user.userId]
+      );
+      const public_key = walletResult.rows[0]?.public_key;
+
+      if (
+        public_key !== dispute.sender_wallet &&
+        public_key !== dispute.recipient_wallet
+      ) {
+        return res
+          .status(403)
+          .json({ error: "You are not a party to this dispute" });
+      }
+    }
+
+    res.json({ dispute });
   } catch (err) {
     next(err);
   }
