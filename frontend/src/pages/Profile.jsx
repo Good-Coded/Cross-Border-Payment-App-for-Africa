@@ -394,11 +394,15 @@ export default function Profile() {
     }
   };
 
-  const copyAddress = () => {
-    navigator.clipboard.writeText(user?.wallet_address || '');
-    setCopied(true);
-    toast.success(t('profile.address_copied'));
-    setTimeout(() => setCopied(false), 2000);
+  const copyAddress = async () => {
+    try {
+      await navigator.clipboard.writeText(user?.wallet_address || '');
+      setCopied(true);
+      toast.success(t('profile.address_copied'));
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error('Failed to copy address');
+    }
   };
 
   const handleLogout = () => {
@@ -461,10 +465,14 @@ export default function Profile() {
     }
   };
 
-  const copyKey = () => {
-    navigator.clipboard.writeText(exportedKey);
-    setKeyCopied(true);
-    setTimeout(() => setKeyCopied(false), 2000);
+  const copyKey = async () => {
+    try {
+      await navigator.clipboard.writeText(exportedKey);
+      setKeyCopied(true);
+      setTimeout(() => setKeyCopied(false), 2000);
+    } catch {
+      toast.error('Failed to copy key');
+    }
   };
 
   const closeBackup = () => {

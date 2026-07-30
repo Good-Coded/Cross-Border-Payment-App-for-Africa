@@ -271,11 +271,15 @@ export default function Dashboard() {
     }
   }, [loadDashboard, isOnline]);
 
-  const copyAddress = () => {
+  const copyAddress = async () => {
     if (!wallet?.public_key) return;
-    navigator.clipboard.writeText(wallet.public_key);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    try {
+      await navigator.clipboard.writeText(wallet.public_key);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error('Failed to copy address');
+    }
   };
 
   const fundWallet = async () => {
