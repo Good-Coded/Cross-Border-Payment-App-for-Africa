@@ -130,7 +130,15 @@ async function getInfo(req, res, next) {
  */
 async function createTransaction(req, res, next) {
   try {
-    const { amount, asset_code = 'USDC', receiver_account, fields = {}, sender_name, sender_email, callback_url } = req.body;
+    const {
+      amount,
+      asset_code = 'USDC',
+      receiver_account,
+      fields = {},
+      sender_name,
+      sender_email,
+      callback_url,
+    } = req.body;
     const userId = req.user.userId;
 
     if (callback_url && !validateCallbackUrl(callback_url)) {
@@ -140,16 +148,6 @@ async function createTransaction(req, res, next) {
     if (!amount || !receiver_account) {
       return res.status(400).json({ error: 'amount and receiver_account required' });
     }
-
-    const {
-      amount,
-      asset_code = 'USDC',
-      receiver_account,
-      fields = {},
-      sender_name,
-      sender_email
-    } = req.body;
-    const userId = req.user.userId;
 
     // Validate fields against anchor /info schema
     let requiredFields = [];
@@ -175,13 +173,10 @@ async function createTransaction(req, res, next) {
     const txId = uuidv4();
     const sharedSecret = callback_url ? crypto.randomBytes(32).toString('hex') : null;
     await db.query(
-      `INSERT INTO sep31_transactions (id, sender_id, receiver_account, amount, asset_code, kyc_verified, status, callback_url, shared_secret)
+      `INSERT INTO sep31_transactions
+         (id, sender_id, receiver_account, amount, asset_code, kyc_verified, status, callback_url, shared_secret)
        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)`,
       [txId, userId, receiver_account, amount, asset_code, kycVerified, callback_url || null, sharedSecret]
-      `INSERT INTO sep31_transactions
-         (id, sender_id, receiver_account, amount, asset_code, kyc_verified, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-      [txId, userId, receiver_account, amount, asset_code, kycVerified]
     );
 
     logger.info('SEP-31 transaction created', {

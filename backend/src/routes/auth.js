@@ -169,7 +169,6 @@ router.post(
 
 router.get('/2fa/backup-codes/count', authMiddleware, getBackupCodeCount);
 
-const { listSessions, revokeSession, revokeAllSessions } = require('../controllers/sessionController');
 // Avatar upload — 5 MB limit, memory storage (magic bytes checked in controller)
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
@@ -190,6 +189,8 @@ router.patch(
   ],
   validate,
   changePassword
+);
+
 router.post(
   '/avatar',
   authMiddleware,
