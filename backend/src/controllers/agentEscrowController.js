@@ -221,24 +221,35 @@ async function cancel(req, res, next) {
  * records the cumulative released amount, and returns the new remaining balance.
  */
 async function partialRelease(req, res, next) {
+  const { id } = req.params;
+  const amount = parseFloat(req.body.amount);
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: "Amount must be greater than 0" });
+  }
+
+  const client = await db.pool.connect();
   try {
-    const { id } = req.params;
-    const amount = parseFloat(req.body.amount);
+    await client.query("BEGIN");
 
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ error: "Amount must be greater than 0" });
-    }
-
-    const escrowResult = await db.query("SELECT * FROM agent_escrows WHERE id = $1", [id]);
+    // Lock the escrow row for the duration of the transaction so concurrent
+    // partial-release requests serialize instead of racing on a stale read.
+    const escrowResult = await client.query(
+      "SELECT * FROM agent_escrows WHERE id = $1 FOR UPDATE",
+      [id]
+    );
     if (!escrowResult.rows[0]) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ error: "Escrow not found" });
     }
     const escrow = escrowResult.rows[0];
 
     if (escrow.status !== "pending") {
+      await client.query("ROLLBACK");
       return res.status(400).json({ error: "Only pending escrows can be partially released" });
     }
     if (escrow.sender_wallet !== req.user.walletAddress) {
+      await client.query("ROLLBACK");
       return res.status(403).json({ error: "Only the sender can release this escrow" });
     }
 
@@ -247,6 +258,7 @@ async function partialRelease(req, res, next) {
     const remaining = total - alreadyReleased;
 
     if (amount > remaining + 1e-7) {
+      await client.query("ROLLBACK");
       return res.status(400).json({
         error: `Amount exceeds remaining escrow balance (${remaining})`,
       });
@@ -261,7 +273,7 @@ async function partialRelease(req, res, next) {
     // Fully drained escrows transition to completed.
     const fullyReleased = newRemaining <= 1e-7;
 
-    const updated = await db.query(
+    const updated = await client.query(
       `UPDATE agent_escrows
          SET released_amount = $1,
              status = CASE WHEN $2 THEN 'completed' ELSE status END
@@ -269,6 +281,8 @@ async function partialRelease(req, res, next) {
        RETURNING *`,
       [newReleased, fullyReleased, id]
     );
+
+    await client.query("COMMIT");
 
     res.json({
       message: "Partial release successful",
@@ -280,7 +294,10 @@ async function partialRelease(req, res, next) {
       status: updated.rows[0].status,
     });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     next(err);
+  } finally {
+    client.release();
   }
 }
 
@@ -296,7 +313,16 @@ async function getEscrow(req, res, next) {
     if (!result.rows[0]) {
       return res.status(404).json({ error: "Escrow not found" });
     }
-    res.json({ escrow: result.rows[0] });
+    const escrow = result.rows[0];
+
+    const isParty =
+      req.user.walletAddress === escrow.sender_wallet ||
+      req.user.walletAddress === escrow.agent_wallet;
+    if (!isParty && req.user.role !== "admin") {
+      return res.status(403).json({ error: "You are not authorized to view this escrow" });
+    }
+
+    res.json({ escrow });
   } catch (err) {
     next(err);
   }
