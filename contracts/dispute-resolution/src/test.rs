@@ -8,6 +8,8 @@ use soroban_sdk::{
 
 use crate::{DisputeResolutionContract, DisputeResolutionContractClient, DisputeStatus};
 
+const DEFAULT_FILING_FEE: i128 = 50_000000;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn setup() -> (
@@ -45,7 +47,7 @@ fn open(
 ) -> (Address, Address, u64) {
     let sender = Address::generate(env);
     let recipient = Address::generate(env);
-    mint(env, usdc_id, &sender, amount);
+    mint(env, usdc_id, &sender, amount + DEFAULT_FILING_FEE);
     let id = client.open_dispute(&sender, &sender, &recipient, &amount);
     (sender, recipient, id)
 }
@@ -104,7 +106,7 @@ fn test_open_dispute_by_recipient() {
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let amount = 200_0000000i128;
-    mint(&env, &usdc_id, &recipient, amount);
+    mint(&env, &usdc_id, &recipient, amount + DEFAULT_FILING_FEE);
     let id = client.open_dispute(&recipient, &sender, &recipient, &amount);
     let d = client.get_dispute(&id);
     assert_eq!(d.status, DisputeStatus::Open);
@@ -117,6 +119,76 @@ fn test_open_dispute_zero_amount_panics() {
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     client.open_dispute(&sender, &sender, &recipient, &0);
+}
+
+#[test]
+fn test_open_dispute_returns_filing_fee_to_opener_on_win() {
+    let (env, client, _, arbitrator, usdc_id, _) = setup();
+    let amount = 1_000_0000000i128;
+    let (sender, _, id) = open(&env, &client, &usdc_id, amount);
+
+    client.resolve_dispute(&arbitrator, &id, &false);
+    env.ledger().with_mut(|li| li.timestamp += 24 * 60 * 60 + 1);
+    client.finalize_resolution(&id);
+
+    assert_eq!(
+        TokenClient::new(&env, &usdc_id).balance(&sender),
+        amount + DEFAULT_FILING_FEE
+    );
+}
+
+#[test]
+fn test_open_dispute_sends_filing_fee_to_fee_distributor_on_loss() {
+    let (env, client, admin, arbitrator, usdc_id, _) = setup();
+    let amount = 1_000_0000000i128;
+    let (sender, recipient, id) = open(&env, &client, &usdc_id, amount);
+
+    client.resolve_dispute(&arbitrator, &id, &true);
+    env.ledger().with_mut(|li| li.timestamp += 24 * 60 * 60 + 1);
+    client.finalize_resolution(&id);
+
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&recipient), amount);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&admin), DEFAULT_FILING_FEE);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), 0);
+}
+
+#[test]
+#[should_panic(expected = "Insufficient balance for dispute filing fee")]
+fn test_open_dispute_insufficient_filing_fee_panics() {
+    let (env, client, _, _, usdc_id, _) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    mint(&env, &usdc_id, &sender, 10_000000);
+    client.open_dispute(&sender, &sender, &recipient, &10_000000);
+}
+
+#[test]
+fn test_update_filing_fee_applies_new_fee() {
+    let (env, client, admin, _, usdc_id, _) = setup();
+    let amount = 1_000_0000000i128;
+    client.update_filing_fee(&admin, &100_000000);
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    mint(&env, &usdc_id, &sender, amount + 100_000000);
+    client.open_dispute(&sender, &sender, &recipient, &amount);
+
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), 0);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: caller is not admin")]
+fn test_update_filing_fee_non_admin_panics() {
+    let (env, client, _, _, _, _) = setup();
+    let impostor = Address::generate(&env);
+    client.update_filing_fee(&impostor, &100_000000);
+}
+
+#[test]
+#[should_panic(expected = "filing fee exceeds maximum of 50 USDC")]
+fn test_update_filing_fee_above_cap_panics() {
+    let (_, client, admin, _, _, _) = setup();
+    client.update_filing_fee(&admin, &500_000_001);
 }
 
 #[test]

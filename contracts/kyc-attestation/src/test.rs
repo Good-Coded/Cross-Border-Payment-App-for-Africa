@@ -2,7 +2,7 @@
 
 use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Bytes, Env};
 
-use crate::{KycAttestationContract, KycAttestationContractClient};
+use crate::{KycAttestationContract, KycAttestationContractClient, KycTier};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -193,4 +193,51 @@ fn test_get_attestation_hash_matches() {
     let h = hash(&env);
     client.attest(&admin, &user, &h);
     assert_eq!(client.get_attestation(&user).kyc_hash, h);
+}
+
+#[test]
+fn test_batch_revoke_revokes_valid_pairs() {
+    let (env, client, admin) = setup();
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+
+    client.attest(&admin, &user1, &hash(&env));
+    client.attest(&admin, &user2, &hash(&env));
+
+    let mut revocations = soroban_sdk::Vec::new(&env);
+    revocations.push_back((user1.clone(), KycTier::Standard));
+    revocations.push_back((user2.clone(), KycTier::Basic));
+
+    client.batch_revoke(&admin, &revocations);
+
+    assert!(!client.is_verified(&user1));
+    assert!(!client.is_verified(&user2));
+}
+
+#[test]
+fn test_batch_revoke_skips_missing_attestations() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    client.attest(&admin, &user, &hash(&env));
+
+    let mut revocations = soroban_sdk::Vec::new(&env);
+    revocations.push_back((user.clone(), KycTier::Standard));
+    revocations.push_back((Address::generate(&env), KycTier::Premium));
+
+    client.batch_revoke(&admin, &revocations);
+
+    assert!(!client.is_verified(&user));
+}
+
+#[test]
+#[should_panic(expected = "Batch size exceeds maximum of 50")]
+fn test_batch_revoke_exceeds_limit_panics() {
+    let (env, client, admin) = setup();
+    let mut revocations = soroban_sdk::Vec::new(&env);
+
+    for _ in 0..51 {
+        revocations.push_back((Address::generate(&env), KycTier::Basic));
+    }
+
+    client.batch_revoke(&admin, &revocations);
 }

@@ -29,7 +29,7 @@
 //! `transfer`, `transfer_from`.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
 };
 
 #[contracttype]
@@ -51,6 +51,16 @@ pub enum DataKey {
     Balance(Address),
     Allowance(Address, Address), // (owner, spender)
     KycContractAddress,
+    /// Registered holders seen by the token contract.
+    Hholders,
+    /// Snapshot counter used to assign the next snapshot id.
+    SnapshotCounter,
+    /// Number of active snapshots currently stored.
+    SnapshotCount,
+    /// Ledger sequence at which a snapshot was taken.
+    SnapshotLedger(u32),
+    /// Balance captured for a holder at a specific snapshot id.
+    Snapshot(u32, Address),
     /// Maps a tier index (0–4) to its Tier configuration.
     Tier(u32),
 }
@@ -107,6 +117,9 @@ impl LoyaltyTokenContract {
         env.storage().persistent().set(&DataKey::MaxSupply, &max_supply);
         // transfer_fee_bps defaults to 0 (fees disabled at init).
         env.storage().persistent().set(&DataKey::TransferFeeBps, &0u32);
+        env.storage().persistent().set(&DataKey::Hholders, &Vec::new(&env));
+        env.storage().persistent().set(&DataKey::SnapshotCounter, &0u32);
+        env.storage().persistent().set(&DataKey::SnapshotCount, &0u32);
 
         // Install default tiers.
         env.storage().persistent().set(
@@ -163,6 +176,100 @@ impl LoyaltyTokenContract {
             .persistent()
             .get(&DataKey::Balance(account))
             .unwrap_or(0)
+    }
+
+    /// Create a snapshot of all registered holders' current balances.
+    /// Admin only. Returns the generated snapshot id.
+    pub fn create_snapshot(env: Env, admin: Address) -> u32 {
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+
+        let active_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotCount)
+            .unwrap_or(0);
+        if active_count >= 10 {
+            panic!("Snapshot limit reached");
+        }
+
+        let snapshot_id: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage().persistent().set(&DataKey::SnapshotCounter, &snapshot_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SnapshotCount, &(active_count + 1));
+        env.storage()
+            .persistent()
+            .set(&DataKey::SnapshotLedger(snapshot_id), &env.ledger().sequence());
+
+        let holders: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Hholders)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..holders.len() {
+            let holder = holders.get(i).unwrap();
+            let bal = Self::balance(env.clone(), holder.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Snapshot(snapshot_id, holder.clone()), &bal);
+        }
+
+        snapshot_id
+    }
+
+    /// Return the balance recorded for a holder at the specified snapshot.
+    /// Returns 0 when no balance was recorded for that holder at that snapshot.
+    pub fn snapshot_balance(env: Env, snapshot_id: u32, user: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id, user))
+            .unwrap_or(0)
+    }
+
+    /// Delete a snapshot and remove its stored balance entries. Admin only.
+    pub fn delete_snapshot(env: Env, admin: Address, snapshot_id: u32) {
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+
+        if env.storage().persistent().has(&DataKey::SnapshotLedger(snapshot_id)) {
+            let holders: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Hholders)
+                .unwrap_or_else(|| Vec::new(&env));
+            for i in 0..holders.len() {
+                let holder = holders.get(i).unwrap();
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::Snapshot(snapshot_id, holder));
+            }
+            env.storage().persistent().remove(&DataKey::SnapshotLedger(snapshot_id));
+
+            let active_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SnapshotCount)
+                .unwrap_or(0);
+            if active_count > 0 {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::SnapshotCount, &(active_count - 1));
+            }
+        }
     }
 
     // ── SEP-41: allowances ────────────────────────────────────────────────────
@@ -646,6 +753,9 @@ impl LoyaltyTokenContract {
         env.storage()
             .persistent()
             .set(&DataKey::Balance(to.clone()), &(bal + amount));
+        if amount > 0 {
+            Self::_register_holder(env, to);
+        }
     }
 
     fn _debit(env: &Env, from: &Address, amount: i128) {
@@ -660,6 +770,27 @@ impl LoyaltyTokenContract {
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(bal - amount));
+    }
+
+    fn _register_holder(env: &Env, holder: &Address) {
+        let mut holders: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Hholders)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut already_registered = false;
+        for i in 0..holders.len() {
+            if holders.get(i).unwrap() == holder.clone() {
+                already_registered = true;
+                break;
+            }
+        }
+
+        if !already_registered {
+            holders.push_back(holder.clone());
+            env.storage().persistent().set(&DataKey::Hholders, &holders);
+        }
     }
 
     fn _check_kyc_for_transfer(env: &Env, from: &Address, to: &Address) {

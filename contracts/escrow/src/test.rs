@@ -6,7 +6,10 @@ use soroban_sdk::{
     Address, BytesN, Env, IntoVal, Symbol, Val,
 };
 
-use crate::{EscrowContract, EscrowContractClient, EscrowExpired, EscrowStatus, FeesWithdrawn, PartialRelease};
+use crate::{
+    CONTRACT_VERSION, EscrowContract, EscrowContractClient, EscrowExpired, EscrowStatus,
+    FeesWithdrawn, PartialRelease,
+};
 
 fn setup() -> (Env, EscrowContractClient<'static>, Address, Address) {
     let env = Env::default();
@@ -29,6 +32,23 @@ fn test_initialize() {
     let (stored_admin, stored_usdc) = client.get_metadata();
     assert_eq!(stored_admin, admin);
     assert_eq!(stored_usdc, usdc_id);
+    assert_eq!(client.get_contract_version(), CONTRACT_VERSION);
+}
+
+#[test]
+fn test_migrate_sets_contract_version() {
+    let (_, client, admin, _) = setup();
+    assert_eq!(client.get_contract_version(), CONTRACT_VERSION);
+    client.migrate(&admin);
+    assert_eq!(client.get_contract_version(), CONTRACT_VERSION);
+}
+
+#[test]
+#[should_panic(expected = "Only admin can perform this action")]
+fn test_non_admin_cannot_migrate() {
+    let (env, client, _, _) = setup();
+    let non_admin = Address::generate(&env);
+    client.migrate(&non_admin);
 }
 
 #[test]
