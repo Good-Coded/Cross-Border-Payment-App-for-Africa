@@ -178,12 +178,12 @@ router.post(
 );
 router.get('/signers', listSigners);
 router.post('/upgrade-business', upgradeToBusinessAccount);
-router.get('/signers', isAdminOrOwner, listSigners);
+router.get('/signers', isAdminOrOwner(), listSigners);
 router.get('/signers/horizon', getSignersFromHorizon);
 router.post('/clear-inflation-destination', clearInflationDestinationHandler);
 router.post(
   '/signers',
-  isAdminOrOwner,
+  isAdminOrOwner(),
   [
     body('signer_public_key')
       .notEmpty()
@@ -199,7 +199,7 @@ router.post(
 );
 router.delete(
   '/signers/:signer_public_key',
-  isAdminOrOwner,
+  isAdminOrOwner(),
   [
     param('signer_public_key').custom((v) => {
       if (!StellarSdk.StrKey.isValidEd25519PublicKey(v)) throw new Error('Invalid Stellar public key');
