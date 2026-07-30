@@ -90,8 +90,39 @@ async function importContacts(req, res, next) {
 
     // Parse CSV from buffer — we avoid external deps and use a hand-rolled parser
     // that handles optional quotes, trims whitespace, and skips blank lines.
+    // The parser is quote-aware from the start so that fields containing embedded
+    // newlines (RFC 4180) are handled correctly.
     const csvText = req.file.buffer.toString('utf8');
-    const lines = csvText.split(/\r?\n/);
+
+    // Quote-aware line splitter: splits on newlines that are NOT inside
+    // double-quoted fields.
+    function splitCsvLines(text) {
+      const lines = [];
+      let current = '';
+      let inQuotes = false;
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '"') {
+          if (inQuotes && text[i + 1] === '"') { current += '"'; i++; }
+          else { inQuotes = !inQuotes; }
+        } else if ((ch === '\n' || (ch === '\r' && text[i + 1] === '\n')) && !inQuotes) {
+          if (ch === '\r') i++; // skip \n after \r
+          lines.push(current);
+          current = '';
+        } else if (ch === '\r' && !inQuotes) {
+          lines.push(current);
+          current = '';
+        } else {
+          current += ch;
+        }
+      }
+      if (current !== '' || text.endsWith('\n')) {
+        lines.push(current);
+      }
+      return lines;
+    }
+
+    const lines = splitCsvLines(csvText);
 
     if (lines.length < 2) {
       return res.status(400).json({ error: 'CSV file must contain a header row and at least one data row.' });
@@ -99,7 +130,7 @@ async function importContacts(req, res, next) {
 
     // Parse header — normalise to lowercase, strip BOM
     const headerLine = lines[0].replace(/^\uFEFF/, '').toLowerCase();
-    const headers = headerLine.split(',').map((h) => h.trim().replace(/^"|"$/g, ''));
+    const headers = parseCsvFields(headerLine);
 
     const nameIdx    = headers.indexOf('name');
     const addressIdx = headers.indexOf('address');
@@ -124,8 +155,8 @@ async function importContacts(req, res, next) {
       });
     }
 
-    // Helper: parse one CSV line respecting double-quoted fields
-    function parseCsvLine(line) {
+    // Helper: parse one CSV line into fields respecting double-quoted fields
+    function parseCsvFields(line) {
       const fields = [];
       let current = '';
       let inQuotes = false;
@@ -151,7 +182,7 @@ async function importContacts(req, res, next) {
 
     for (let i = 0; i < dataLines.length; i++) {
       const rowNum = i + 2; // 1-based, +1 for header
-      const fields = parseCsvLine(dataLines[i]);
+      const fields = parseCsvFields(dataLines[i]);
 
       const name    = (fields[nameIdx]    || '').trim();
       const address = (fields[addressIdx] || '').trim();
