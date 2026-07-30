@@ -68,7 +68,6 @@ function isNetworkError(err) {
  * Execute fn(server) with automatic failover to the fallback node on network errors only.
  * Records Horizon call duration via Prometheus.
  */
-async function withFallback(fn, logger = require('../utils/logger')) {
 async function withFallback(fn, operation = 'unknown') {
   const end = horizonRequestDuration.startTimer({ operation });
   try {
@@ -1024,13 +1023,10 @@ async function addAccountSigner({ ownerPublicKey, encryptedSecretKey, signerPubl
     .setTimeout(30)
     .build();
 
-  transaction.sign(distributionKeypair);
-
-  const result = await server.submitTransaction(transaction);
-  return {
-    transactionHash: result.hash,
-    ledger: result.ledger
-  };
+  tx.sign(ownerKeypair);
+  const rawResult = await withRetry(() => server.submitTransaction(tx), { label: 'submitTransaction(addSigner)' });
+  const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(addSigner)');
+  return { transactionHash: result.hash };
 }
 
 // Get AFRI asset information
