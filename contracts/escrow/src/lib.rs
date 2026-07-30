@@ -166,11 +166,16 @@ pub enum DataKey {
 const DEFAULT_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 
-/// Maximum allowed fee: 50% (5000 bps). Configurable by admin via contract upgrade.
-const MAX_FEE_BPS: u32 = 5000;
+/// Maximum allowed fee: 10% (1000 bps) per issue #766.
+const MAX_FEE_BPS: u32 = 1000;
 
 /// Minimum escrow amount in stroops to prevent integer-division rounding to zero fee.
 const MIN_ESCROW_AMOUNT: i128 = 100;
+
+// SECURITY: i128 max is ~170 trillion USDC in stroops (1.7 * 10^20).
+// MAX_ESCROW_AMOUNT = 1,000,000 USDC = 10_000_000_000_000 stroops.
+// Intermediate fee calc uses (amount / 10000).saturating_mul(bps) to prevent overflow.
+const MAX_ESCROW_AMOUNT: i128 = 10_000_000_000_000;
 
 fn require_admin(env: &Env, admin: &Address) {
     admin.require_auth();
@@ -314,11 +319,14 @@ impl EscrowContract {
         if amount < MIN_ESCROW_AMOUNT {
             panic!("Amount below minimum (100 stroops)");
         }
+        if amount > MAX_ESCROW_AMOUNT {
+            panic!("Amount exceeds maximum escrow amount");
+        }
         if release_fee_bps == 10000 {
             panic!("Fee cannot be 100%");
         }
         if release_fee_bps > MAX_FEE_BPS {
-            panic!("Fee exceeds maximum of 5000 bps (50%)");
+            panic!("Fee exceeds maximum of 1000 bps (10%)");
         }
         if sender == recipient || sender == agent || recipient == agent {
             panic!("Sender, recipient, and agent must be distinct addresses");
@@ -461,8 +469,11 @@ impl EscrowContract {
             panic!("Escrow has expired");
         }
 
-        let fee_amount = (escrow.amount * escrow.release_fee_bps as i128) / 10000;
-        let agent_amount = escrow.amount - fee_amount;
+        let fee_amount = (escrow.amount / 10000).saturating_mul(escrow.release_fee_bps as i128);
+        let agent_amount = escrow.amount.checked_sub(fee_amount).expect("fee exceeds escrow amount");
+        if agent_amount <= 0 {
+            panic!("fee cannot exceed 100% of escrow");
+        }
 
         let usdc_address: Address = env
             .storage()
@@ -558,8 +569,11 @@ impl EscrowContract {
             panic!("Release amount exceeds escrow balance");
         }
 
-        let fee_amount = (amount * escrow.release_fee_bps as i128) / 10000;
-        let agent_amount = amount - fee_amount;
+        let fee_amount = (amount / 10000).saturating_mul(escrow.release_fee_bps as i128);
+        let agent_amount = amount.checked_sub(fee_amount).expect("fee exceeds release amount");
+        if agent_amount <= 0 {
+            panic!("fee cannot exceed 100% of escrow");
+        }
 
         let usdc_address: Address = env
             .storage()
@@ -903,11 +917,14 @@ impl EscrowContract {
             if escrow_params.amount < MIN_ESCROW_AMOUNT {
                 panic!("Amount below minimum (100 stroops)");
             }
+            if escrow_params.amount > MAX_ESCROW_AMOUNT {
+                panic!("Amount exceeds maximum escrow amount");
+            }
             if escrow_params.release_fee_bps == 10000 {
                 panic!("Fee cannot be 100%");
             }
             if escrow_params.release_fee_bps > MAX_FEE_BPS {
-                panic!("Fee exceeds maximum of 5000 bps (50%)");
+                panic!("Fee exceeds maximum of 1000 bps (10%)");
             }
             if sender == escrow_params.recipient
                 || sender == escrow_params.agent
