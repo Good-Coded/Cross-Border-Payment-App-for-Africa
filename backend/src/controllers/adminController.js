@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const db = require('../db');
 const { getStellarStats } = require('../services/stellar');
 const { attestKyc, revokeKyc } = require('../services/kycAttestation');
@@ -873,6 +874,33 @@ async function bulkExport(req, res, next) {
   }
 }
 
+// Exported PII is encrypted at rest and purged after this retention window (issue #881).
+const EXPORT_JOB_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function getExportEncryptionKey() {
+  return Buffer.from(process.env.ENCRYPTION_KEY, 'utf8').slice(0, 32);
+}
+
+function encryptExportPayload(plaintext) {
+  const key = getExportEncryptionKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, encrypted]).toString('base64');
+}
+
+function decryptExportPayload(ciphertext) {
+  const key = getExportEncryptionKey();
+  const buf = Buffer.from(ciphertext, 'base64');
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const encrypted = buf.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+}
+
 async function processBulkExportJob(jobId, userIds) {
   await db.query(`UPDATE export_jobs SET status='processing' WHERE id=$1`, [jobId]);
   const { rows } = await db.query(
@@ -881,11 +909,14 @@ async function processBulkExportJob(jobId, userIds) {
      WHERE u.id = ANY($1::uuid[])`,
     [userIds]
   );
-  // Store as JSON download URL (in production this would upload to S3)
-  const downloadUrl = `data:application/json;base64,${Buffer.from(JSON.stringify(rows)).toString('base64')}`;
+  // Encrypt the exported PII at rest; it is only ever decrypted for the owning
+  // admin, and only within the retention window (in production this would
+  // instead upload to object storage behind a signed, expiring URL).
+  const encryptedPayload = encryptExportPayload(JSON.stringify(rows));
+  const expiresAt = new Date(Date.now() + EXPORT_JOB_RETENTION_MS);
   await db.query(
-    `UPDATE export_jobs SET status='completed', download_url=$1, completed_at=NOW() WHERE id=$2`,
-    [downloadUrl, jobId]
+    `UPDATE export_jobs SET status='completed', download_url=$1, expires_at=$2, completed_at=NOW() WHERE id=$3`,
+    [encryptedPayload, expiresAt, jobId]
   );
 }
 
@@ -893,11 +924,40 @@ async function getJobStatus(req, res, next) {
   try {
     const { jobId } = req.params;
     const { rows } = await db.query(
-      `SELECT id, status, operation, download_url, error, created_at, completed_at FROM export_jobs WHERE id=$1`,
+      `SELECT id, admin_id, status, operation, download_url, expires_at, error, created_at, completed_at
+       FROM export_jobs WHERE id=$1`,
       [jobId]
     );
-    if (!rows[0]) return res.status(404).json({ error: 'Job not found' });
-    res.json(rows[0]);
+    const job = rows[0];
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    if (job.admin_id !== req.user.userId) {
+      return res.status(403).json({ error: 'Only the admin who created this export job may access it' });
+    }
+
+    const isExpired = job.expires_at && new Date(job.expires_at) <= new Date();
+    if (isExpired && job.download_url) {
+      // Lazily purge the encrypted payload once the retention window has elapsed
+      await db.query(`UPDATE export_jobs SET download_url=NULL WHERE id=$1`, [jobId]);
+      job.download_url = null;
+    }
+
+    let downloadUrl = null;
+    if (job.download_url && job.status === 'completed' && !isExpired) {
+      const plaintext = decryptExportPayload(job.download_url);
+      downloadUrl = `data:application/json;base64,${Buffer.from(plaintext).toString('base64')}`;
+    }
+
+    res.json({
+      id: job.id,
+      status: isExpired ? 'expired' : job.status,
+      operation: job.operation,
+      download_url: downloadUrl,
+      error: job.error,
+      created_at: job.created_at,
+      completed_at: job.completed_at,
+      expires_at: job.expires_at,
+    });
   } catch (err) {
     next(err);
   }

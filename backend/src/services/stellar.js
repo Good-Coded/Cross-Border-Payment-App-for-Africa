@@ -9,6 +9,8 @@ const {
   AccountResponseSchema,
   TransactionSubmitResponseSchema,
   TransactionPageSchema,
+  TransactionRecordSchema,
+  OperationPageSchema,
   PathPageSchema,
   validateHorizonResponse,
 } = require('../utils/horizonSchemas');
@@ -693,6 +695,62 @@ async function getTransactions(publicKey, limit = 20) {
   }
 }
 
+/**
+ * Verify that a given transaction hash corresponds to a successful Stellar
+ * transaction that pays at least `minAmount` of `asset` to `destination`.
+ * Used to confirm claimed payment requests before trusting a caller-supplied
+ * txHash (issue #878).
+ *
+ * @returns {Promise<{verified: boolean, reason?: string}>}
+ */
+async function verifyIncomingPayment({ txHash, destination, asset, minAmount }) {
+  if (typeof txHash !== 'string' || !/^[0-9a-f]{64}$/i.test(txHash)) {
+    return { verified: false, reason: 'txHash must be a 64-character hex transaction hash' };
+  }
+  const normalizedHash = txHash.toLowerCase();
+
+  let txRecord;
+  try {
+    const raw = await withFallback(s => s.transactions().transaction(normalizedHash).call());
+    txRecord = validateHorizonResponse(TransactionRecordSchema, raw, 'transactions.transaction');
+  } catch (e) {
+    if (e.response?.status === 404) {
+      return { verified: false, reason: 'Transaction not found' };
+    }
+    throw e;
+  }
+
+  if (!txRecord.successful) {
+    return { verified: false, reason: 'Transaction was not successful' };
+  }
+
+  const raw = await withFallback(s => s.operations().forTransaction(normalizedHash).call());
+  const opsPage = validateHorizonResponse(OperationPageSchema, raw, 'operations.forTransaction');
+
+  const assetObj = resolveAsset(asset);
+  const minAmountNum = parseFloat(minAmount);
+
+  const matched = opsPage.records.some(op => {
+    if (!['payment', 'path_payment_strict_receive', 'path_payment_strict_send'].includes(op.type)) {
+      return false;
+    }
+    if (op.to !== destination) return false;
+
+    const assetMatches = assetObj.isNative()
+      ? op.asset_type === 'native'
+      : op.asset_code === assetObj.getCode() && op.asset_issuer === assetObj.getIssuer();
+    if (!assetMatches) return false;
+
+    return parseFloat(op.amount) >= minAmountNum;
+  });
+
+  if (!matched) {
+    return { verified: false, reason: `No payment of at least ${minAmount} ${asset} to ${destination} found on this transaction` };
+  }
+
+  return { verified: true };
+}
+
 // Issue AFRI asset to a recipient
 async function issueAsset(recipientPublicKey, amount) {
   const issuerSecret = decryptPrivateKey(process.env.AFRI_ISSUER_SECRET);
@@ -1085,13 +1143,6 @@ async function getStellarStats() {
   }
 }
 
-
-  tx.sign(ownerKeypair);
-  const rawResult = await withRetry(() => server.submitTransaction(tx), { label: 'submitTransaction(addSigner)' });
-  const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(addSigner)');
-  return { transactionHash: result.hash };
-}
-
 /**
  * Remove a signer (weight=0) and reset thresholds to 1 if no signers remain.
  */
@@ -1450,6 +1501,7 @@ module.exports = {
   sendPayment,
   sendBatchPayment,
   getTransactions,
+  verifyIncomingPayment,
   encryptPrivateKey,
   decryptPrivateKey,
   fetchFee,
