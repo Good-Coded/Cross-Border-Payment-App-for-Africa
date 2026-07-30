@@ -94,6 +94,15 @@ pub struct EmergencyWithdrawnEvent {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct LockBoundsUpdated {
+    pub old_min: u64,
+    pub old_max: u64,
+    pub new_min: u64,
+    pub new_max: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct Vault {
     pub balance: i128,
     pub unlock_time: u64,
@@ -114,6 +123,8 @@ pub enum DataKey {
     FeeDistributor,
     InterestReserve,
     EmergencyWithdrawalAnnounced,
+    MinLockSecs,
+    MaxLockSecs,
 }
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
@@ -134,6 +145,8 @@ impl SavingsVaultContract {
         env.storage().persistent().set(&DataKey::TotalLocked, &0i128);
         env.storage().persistent().set(&DataKey::InterestReserve, &0i128);
         env.storage().persistent().set(&DataKey::InterestRateBps, &0u32);
+        env.storage().persistent().set(&DataKey::MinLockSecs, &86400u64);
+        env.storage().persistent().set(&DataKey::MaxLockSecs, &31536000u64);
     }
 
     /// Set the annual interest rate. Only admin may call this.
@@ -521,6 +534,16 @@ impl SavingsVaultContract {
             panic!("Unlock time must be in the future");
         }
 
+        let min_lock_secs: u64 = env.storage().persistent().get(&DataKey::MinLockSecs).unwrap_or(86400);
+        let max_lock_secs: u64 = env.storage().persistent().get(&DataKey::MaxLockSecs).unwrap_or(31536000);
+        let now = env.ledger().timestamp();
+        let min_unlock = now + min_lock_secs;
+        let max_unlock = now + max_lock_secs;
+
+        if unlock_time < min_unlock || unlock_time > max_unlock {
+            panic!("Lock period out of allowed range (min {}s, max {}s)", min_lock_secs, max_lock_secs);
+        }
+
         let token_address: Address = env
             .storage()
             .persistent()
@@ -790,5 +813,37 @@ impl SavingsVaultContract {
             .persistent()
             .get(&DataKey::YieldAccrued(user))
             .unwrap_or(0)
+    }
+
+    /// Update the minimum and maximum lock period bounds. Admin only.
+    pub fn update_lock_bounds(env: Env, admin: Address, min_secs: u64, max_secs: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        if min_secs >= max_secs {
+            panic!("min_secs must be less than max_secs");
+        }
+
+        let old_min: u64 = env.storage().persistent().get(&DataKey::MinLockSecs).unwrap_or(86400);
+        let old_max: u64 = env.storage().persistent().get(&DataKey::MaxLockSecs).unwrap_or(31536000);
+
+        env.storage().persistent().set(&DataKey::MinLockSecs, &min_secs);
+        env.storage().persistent().set(&DataKey::MaxLockSecs, &max_secs);
+
+        env.events().publish(
+            (Symbol::new(&env, "LockBoundsUpdated"),),
+            LockBoundsUpdated {
+                old_min,
+                old_max,
+                new_min: min_secs,
+                new_max: max_secs,
+            },
+        );
     }
 }
