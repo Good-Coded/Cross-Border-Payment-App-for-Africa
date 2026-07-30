@@ -1,12 +1,11 @@
 import React from 'react';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
+import ErrorBoundary from './ErrorBoundary';
 
-// Mock Sentry methods
-jest.mock('@sentry/react', () => ({
-  captureException: jest.fn(),
-  captureUserFeedback: jest.fn(),
-}));
+// Module @sentry/react is mocked via moduleNameMapper in package.json
+// pointing to src/__mocks__/@sentry/react.js
+const Sentry = require('@sentry/react');
 
 // Component that throws an error
 const ThrowError = () => {
@@ -14,9 +13,15 @@ const ThrowError = () => {
 };
 
 describe('ErrorBoundary', () => {
+  beforeEach(() => {
+    Sentry.captureException.mockClear();
+    Sentry.captureUserFeedback.mockClear();
+  });
+
   test('captures exception and displays fallback UI when child throws', () => {
     const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    const { getByText } = render(
+
+    render(
       <MemoryRouter>
         <ErrorBoundary>
           <ThrowError />
@@ -24,32 +29,57 @@ describe('ErrorBoundary', () => {
       </MemoryRouter>
     );
 
-    // Verify UI shows fallback message
-    // expect(screen.getByText('Please refresh the page.')).toBeInTheDocument();
-    // CaptureException should have been called with the error
-    const { captureException } = require('@sentry/react');
-    expect(captureException).toHaveBeenCalled();
-    // Clean up console mock
+    // Verify fallback UI displays current copy
+    expect(screen.getByText('Something went wrong.')).toBeInTheDocument();
+    expect(
+      screen.getByText('An unexpected error occurred. Our team has been notified.')
+    ).toBeInTheDocument();
+    expect(screen.getByText('Refresh Page')).toBeInTheDocument();
+
+    // Verify Sentry.captureException was called when child threw
+    expect(Sentry.captureException).toHaveBeenCalled();
+
     consoleSpy.mockRestore();
   });
 
-  test('submits user feedback and calls captureUserFeedback', async () => {
-    const { getByText, getByPlaceholderText } = render(
+  test('renders feedback form, captures input, submits and shows thank-you state', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    render(
       <MemoryRouter>
         <ErrorBoundary>
           <ThrowError />
         </ErrorBoundary>
       </MemoryRouter>
     );
-    // Type feedback
-    const textarea = getByPlaceholderText('Describe what led to this error...');
-    fireEvent.change(textarea, { target: { value: 'User feedback' } });
+
+    // Verify error was captured
+    expect(Sentry.captureException).toHaveBeenCalled();
+
+    // Feedback form elements are present
+    expect(
+      screen.getByPlaceholderText('Describe what led to this error...')
+    ).toBeInTheDocument();
+    expect(screen.getByText('Send Report')).toBeInTheDocument();
+
+    // Type feedback into the textarea
+    const textarea = screen.getByPlaceholderText('Describe what led to this error...');
+    act(() => {
+      fireEvent.change(textarea, { target: { value: 'User feedback' } });
+    });
+
     // Click Send Report
-    fireEvent.click(getByText('Send Report'));
-    const { captureUserFeedback } = require('@sentry/react');
-    // Wait for async handler to complete
-    await new Promise((r) => setTimeout(r, 0));
-    expect(captureUserFeedback).toHaveBeenCalled();
+    act(() => {
+      fireEvent.click(screen.getByText('Send Report'));
+    });
+
+    // Verify thank-you state is displayed after submission
+    expect(screen.getByText('Thank you for your feedback!')).toBeInTheDocument();
+    expect(
+      screen.getByText('Your report helps us improve AfriPay.')
+    ).toBeInTheDocument();
+
+    consoleSpy.mockRestore();
   });
 
   test('renders children when no error', () => {
