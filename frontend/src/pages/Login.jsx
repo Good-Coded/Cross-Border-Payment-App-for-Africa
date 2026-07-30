@@ -7,7 +7,7 @@ import { useTranslation } from 'react-i18next';
 import api from '../utils/api';
 
 export default function Login() {
-  const { login } = useAuth();
+  const { login, updateUser } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const { t } = useTranslation();
@@ -116,7 +116,16 @@ export default function Login() {
         // Manually set token + user via the same path login() uses
         const { tokenStore } = await import('../context/AuthContext');
         tokenStore.set(res.data.token);
-        // Reload user via /auth/me so AuthContext is populated
+        // Populate AuthContext user from the login response (same as login() does)
+        updateUser(res.data.user);
+        // Set Sentry user context for error tracking
+        const { default: Sentry } = await import('@sentry/react');
+        Sentry.setUser({
+          id: res.data.user.id,
+          wallet: res.data.user.wallet_address
+            ? `${res.data.user.wallet_address.slice(0, 4)}...${res.data.user.wallet_address.slice(-4)}`
+            : undefined,
+        });
         navigate('/dashboard');
       } catch (err) {
         toast.error(err.response?.data?.error || t('login.totp_error', 'Invalid code. Try again.'));
