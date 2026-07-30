@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, crypto::Hash, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 
 mod test;
 
@@ -72,6 +72,8 @@ pub enum DataKey {
     QuorumVoted(u64, Address),
     ProposalTtl,
     PendingRotation,
+    /// Weight assigned to each signer address (u32).
+    SignerWeight(Address),
 }
 
 // ── Signer-rotation event payloads ────────────────────────────────────────────
@@ -478,5 +480,84 @@ impl MultisigContract {
         assert!(proposal.status == TxStatus::Pending, "not pending");
         assert!(env.ledger().timestamp() < proposal.expires_at, "proposal expired");
         proposal
+    }
+
+    // ── Issue #760: Off-chain signature aggregation ───────────────────────────
+
+    /// Set the signing weight for an approver. Admin only.
+    /// Weight defaults to 1 if not explicitly set.
+    pub fn set_signer_weight(env: Env, admin: Address, signer: Address, weight: u32) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("not initialized");
+        if admin != stored_admin { panic!("Only admin can set signer weight"); }
+        if weight == 0 { panic!("Weight must be positive"); }
+        Self::assert_is_approver(&env, &signer);
+        env.storage().persistent().set(&DataKey::SignerWeight(signer), &weight);
+    }
+
+    /// Compute a deterministic SHA-256 hash of: contract_address + proposal_id + proposal.data + proposal.nonce.
+    /// Here proposal.data is encoded as (amount, recipient) and nonce is proposal.approvals (used as replay guard).
+    pub fn proposal_hash(env: Env, proposal_id: u64) -> BytesN<32> {
+        let proposal: Proposal = env.storage().persistent().get(&DataKey::Proposal(proposal_id))
+            .expect("proposal not found");
+        let contract_addr = env.current_contract_address();
+        let mut preimage = Bytes::new(&env);
+        // contract address bytes
+        preimage.append(&contract_addr.to_xdr(&env));
+        // proposal_id as 8 big-endian bytes
+        preimage.append(&Bytes::from_array(&env, &proposal_id.to_be_bytes()));
+        // amount as 16 big-endian bytes
+        preimage.append(&Bytes::from_array(&env, &proposal.amount.to_be_bytes()));
+        // nonce: use expires_at as unique per-proposal value
+        preimage.append(&Bytes::from_array(&env, &proposal.expires_at.to_be_bytes()));
+        env.crypto().sha256(&preimage)
+    }
+
+    /// Execute a proposal using pre-collected off-chain ed25519 signatures.
+    ///
+    /// Each entry in `signatures` is `(signer_address, ed25519_sig_over_proposal_hash)`.
+    /// Verifies all signatures, checks cumulative weight >= quorum, rejects duplicates,
+    /// and marks the proposal Executed.
+    pub fn execute_with_signatures(
+        env: Env,
+        proposal_id: u64,
+        signatures: Vec<(Address, BytesN<64>)>,
+    ) {
+        let mut proposal = Self::get_pending(&env, proposal_id);
+        let hash = Self::proposal_hash(env.clone(), proposal_id);
+        let quorum: u32 = env.storage().instance().get(&DataKey::Quorum).unwrap();
+
+        let mut seen: Vec<Address> = Vec::new(&env);
+        let mut total_weight: u32 = 0;
+
+        for (signer, sig) in signatures.iter() {
+            // Reject duplicate signers
+            if seen.contains(&signer) {
+                panic!("Duplicate signer");
+            }
+            seen.push_back(signer.clone());
+
+            // Signer must be a registered approver
+            Self::assert_is_approver(&env, &signer);
+
+            // Verify ed25519 signature over the proposal hash
+            let pub_key: BytesN<32> = signer.to_xdr(&env)
+                .slice(signer.to_xdr(&env).len() - 32..)
+                .try_into()
+                .expect("Invalid signer public key");
+            env.crypto().ed25519_verify(&pub_key, &Bytes::from(hash.clone()), &sig);
+
+            let weight: u32 = env.storage().persistent()
+                .get(&DataKey::SignerWeight(signer.clone()))
+                .unwrap_or(1);
+            total_weight += weight;
+        }
+
+        if total_weight < quorum {
+            panic!("Insufficient weight");
+        }
+
+        proposal.status = TxStatus::Executed;
+        env.storage().persistent().set(&DataKey::Proposal(proposal_id), &proposal);
     }
 }

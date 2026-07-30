@@ -593,3 +593,54 @@ fn test_auto_cancel_after_three_consecutive_misses() {
         ScheduleStatus::Cancelled
     );
 }
+
+// ── Issue #763: schedule query functions ────────────────────────────────────
+
+#[test]
+fn test_get_user_schedules_empty() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let other = Address::generate(&env);
+    let ids = client.get_user_schedules(&other, &0, &50);
+    assert_eq!(ids.len(), 0);
+}
+
+#[test]
+fn test_get_user_schedules_three_schedules() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let id1 = client.create_recurring_payment(&sender, &recipient, &token_id, &100_0000000, &86400, &0, &3600, &3);
+    let id2 = client.create_recurring_payment(&sender, &recipient, &token_id, &200_0000000, &86400, &0, &3600, &3);
+    let id3 = client.create_recurring_payment(&sender, &recipient, &token_id, &300_0000000, &86400, &0, &3600, &3);
+    let ids = client.get_user_schedules(&sender, &0, &50);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(ids.get(0).unwrap(), id1);
+    assert_eq!(ids.get(1).unwrap(), id2);
+    assert_eq!(ids.get(2).unwrap(), id3);
+}
+
+#[test]
+fn test_get_active_schedules_filter() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let id1 = client.create_recurring_payment(&sender, &recipient, &token_id, &100_0000000, &86400, &0, &3600, &3);
+    let id2 = client.create_recurring_payment(&sender, &recipient, &token_id, &200_0000000, &86400, &0, &3600, &3);
+    // Cancel id1 — only id2 should appear in active list
+    client.cancel_recurring_payment(&sender, &id1);
+    let active = client.get_active_schedules(&0, &50);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active.get(0).unwrap(), id2);
+}
+
+#[test]
+#[should_panic(expected = "Schedule limit per sender reached")]
+fn test_per_sender_limit_enforcement() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    // Create 500 schedules to hit the limit
+    for _ in 0..500 {
+        client.create_recurring_payment(&sender, &recipient, &token_id, &100_0000000, &86400, &0, &3600, &3);
+    }
+    // 501st must panic
+    client.create_recurring_payment(&sender, &recipient, &token_id, &100_0000000, &86400, &0, &3600, &3);
+}

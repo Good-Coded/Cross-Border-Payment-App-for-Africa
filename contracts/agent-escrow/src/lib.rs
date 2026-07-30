@@ -27,6 +27,10 @@ pub enum DataKey {
     Escrow(u64),
     InsuranceFund,
     InsuranceContributionBps,
+    /// bool flag: true if the address is a registered agent.
+    RegisteredAgent(Address),
+    /// Vec<Address> of all registered agents (bounded to 10000).
+    AgentList,
 }
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -118,6 +122,18 @@ pub struct InsuranceFundContribution {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct EvtAgentRegistered {
+    pub agent: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EvtAgentRemoved {
+    pub agent: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct InsurancePayout {
     pub escrow_id: u64,
     pub recipient: Address,
@@ -156,6 +172,71 @@ impl AgentEscrowContract {
         env.storage().persistent().set(&DataKey::Counter, &0u64);
         env.storage().persistent().set(&DataKey::InsuranceFund, &0i128);
         env.storage().persistent().set(&DataKey::InsuranceContributionBps, &500u32); // 5% default
+        env.storage().persistent().set(&DataKey::AgentList, &soroban_sdk::Vec::<Address>::new(&env));
+    }
+
+    /// Register an agent address in the whitelist. Admin only.
+    /// Emits AgentRegistered event.
+    pub fn register_agent(env: Env, agent: Address) {
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if env.storage().persistent().get::<DataKey, bool>(&DataKey::RegisteredAgent(agent.clone())).unwrap_or(false) {
+            return; // already registered, idempotent
+        }
+        let mut list: soroban_sdk::Vec<Address> = env.storage().persistent()
+            .get(&DataKey::AgentList).unwrap_or(soroban_sdk::Vec::new(&env));
+        if list.len() >= 10000 {
+            panic!("Agent list capacity reached");
+        }
+        list.push_back(agent.clone());
+        env.storage().persistent().set(&DataKey::AgentList, &list);
+        env.storage().persistent().set(&DataKey::RegisteredAgent(agent.clone()), &true);
+        env.events().publish(
+            (Symbol::new(&env, "AgentRegistered"),),
+            EvtAgentRegistered { agent },
+        );
+    }
+
+    /// Remove an agent address from the whitelist. Admin only.
+    /// Emits AgentRemoved event.
+    pub fn remove_agent(env: Env, agent: Address) {
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().persistent().remove(&DataKey::RegisteredAgent(agent.clone()));
+        let list: soroban_sdk::Vec<Address> = env.storage().persistent()
+            .get(&DataKey::AgentList).unwrap_or(soroban_sdk::Vec::new(&env));
+        let mut new_list: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        for a in list.iter() {
+            if a != agent { new_list.push_back(a); }
+        }
+        env.storage().persistent().set(&DataKey::AgentList, &new_list);
+        env.events().publish(
+            (Symbol::new(&env, "AgentRemoved"),),
+            EvtAgentRemoved { agent },
+        );
+    }
+
+    /// Returns true if the address is a registered agent.
+    pub fn is_registered_agent(env: Env, agent: Address) -> bool {
+        env.storage().persistent()
+            .get::<DataKey, bool>(&DataKey::RegisteredAgent(agent))
+            .unwrap_or(false)
+    }
+
+    /// Returns a paginated list of registered agents.
+    /// `start` is the 0-based index; `limit` is capped at 100.
+    pub fn get_registered_agents(env: Env, start: u32, limit: u32) -> soroban_sdk::Vec<Address> {
+        let cap = if limit > 100 { 100 } else { limit };
+        let list: soroban_sdk::Vec<Address> = env.storage().persistent()
+            .get(&DataKey::AgentList).unwrap_or(soroban_sdk::Vec::new(&env));
+        let mut result: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        let len = list.len();
+        let mut i = start;
+        while i < len && (i - start) < cap {
+            result.push_back(list.get(i).unwrap());
+            i += 1;
+        }
+        result
     }
 
     /// Lock USDC in escrow pending agent payout confirmation.
@@ -185,6 +266,14 @@ impl AgentEscrowContract {
         }
 
         sender.require_auth();
+
+        // Validate agent is whitelisted
+        if !env.storage().persistent()
+            .get::<DataKey, bool>(&DataKey::RegisteredAgent(agent.clone()))
+            .unwrap_or(false)
+        {
+            panic!("Agent not registered");
+        }
 
         let usdc: Address = env
             .storage()

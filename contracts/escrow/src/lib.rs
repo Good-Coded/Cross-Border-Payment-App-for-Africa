@@ -348,12 +348,6 @@ impl EscrowContract {
             .get(&DataKey::UsdcAddress)
             .expect("Contract not initialized");
 
-        token::Client::new(&env, &usdc_address).transfer(
-            &sender,
-            &env.current_contract_address(),
-            &amount,
-        );
-
         let current_id: u64 = env
             .storage()
             .persistent()
@@ -380,9 +374,20 @@ impl EscrowContract {
             updated_at: now,
             expires_at: now + DEFAULT_EXPIRY_SECS,
         };
+
+        // Checks-Effects-Interactions: write escrow record to storage BEFORE the
+        // token.transfer call (Interactions step).
+        // Soroban prevents re-entrancy by disallowing cross-contract calls that
+        // re-enter the same contract instance within a single transaction invocation.
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(next_id), &escrow);
+
+        token::Client::new(&env, &usdc_address).transfer(
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "EscrowCreated"),),
@@ -481,12 +486,9 @@ impl EscrowContract {
             .get(&DataKey::UsdcAddress)
             .expect("Contract not initialized");
 
-        token::Client::new(&env, &usdc_address).transfer(
-            &env.current_contract_address(),
-            &escrow.agent,
-            &agent_amount,
-        );
-
+        // Checks-Effects-Interactions: update state BEFORE external token calls.
+        // Soroban prevents re-entrancy by disallowing cross-contract calls that
+        // re-enter the same contract instance within a single transaction invocation.
         let current_fees: i128 = env
             .storage()
             .persistent()
@@ -501,6 +503,13 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        // External calls after state is committed (Interactions step).
+        token::Client::new(&env, &usdc_address).transfer(
+            &env.current_contract_address(),
+            &escrow.agent,
+            &agent_amount,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "EscrowReleased"),),
@@ -678,17 +687,21 @@ impl EscrowContract {
             .get(&DataKey::UsdcAddress)
             .expect("Contract not initialized");
 
-        token::Client::new(&env, &usdc_address).transfer(
-            &env.current_contract_address(),
-            &escrow.sender,
-            &escrow.amount,
-        );
-
+        // Checks-Effects-Interactions: update state BEFORE external token call.
+        // Soroban prevents re-entrancy by disallowing cross-contract calls that
+        // re-enter the same contract instance within a single transaction invocation.
         escrow.status = EscrowStatus::Cancelled;
         escrow.updated_at = env.ledger().timestamp();
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        // External call after state is committed (Interactions step).
+        token::Client::new(&env, &usdc_address).transfer(
+            &env.current_contract_address(),
+            &escrow.sender,
+            &escrow.amount,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "EscrowCancelled"),),

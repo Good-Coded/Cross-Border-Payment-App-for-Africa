@@ -22,7 +22,7 @@ fn setup() -> (Env, AgentEscrowContractClient<'static>, Address, Address) {
     let usdc_id = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
-    client.initialize(&admin, &usdc_id);
+    client.initialize(&admin, &usdc_id, &(48 * 60 * 60));
     (env, client, admin, usdc_id)
 }
 
@@ -42,6 +42,8 @@ fn make_escrow(
     let recipient = Address::generate(env);
     let agent = Address::generate(env);
     mint(env, usdc_id, &sender, amount);
+    // Register agent in whitelist before creating escrow
+    client.register_agent(&agent);
     let id = client.create_escrow(&sender, &recipient, &agent, &amount, &fee_bps);
     (sender, recipient, agent, id)
 }
@@ -63,7 +65,53 @@ fn test_initialize_stores_admin_and_usdc() {
 #[should_panic(expected = "already initialized")]
 fn test_double_initialize_panics() {
     let (_, client, admin, usdc_id) = setup();
-    client.initialize(&admin, &usdc_id);
+    client.initialize(&admin, &usdc_id, &(48 * 60 * 60));
+}
+
+// ── agent whitelist (issue #762) ──────────────────────────────────────────────
+
+#[test]
+fn test_register_and_is_registered_agent() {
+    let (env, client, _, _) = setup();
+    let agent = Address::generate(&env);
+    assert!(!client.is_registered_agent(&agent));
+    client.register_agent(&agent);
+    assert!(client.is_registered_agent(&agent));
+}
+
+#[test]
+fn test_remove_agent() {
+    let (env, client, _, _) = setup();
+    let agent = Address::generate(&env);
+    client.register_agent(&agent);
+    client.remove_agent(&agent);
+    assert!(!client.is_registered_agent(&agent));
+}
+
+#[test]
+#[should_panic(expected = "Agent not registered")]
+fn test_create_escrow_with_unregistered_agent_panics() {
+    let (env, client, _, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env); // NOT registered
+    mint(&env, &usdc_id, &sender, 1_000_0000000);
+    client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &250);
+}
+
+#[test]
+fn test_get_registered_agents_pagination() {
+    let (env, client, _, _) = setup();
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+    client.register_agent(&a1);
+    client.register_agent(&a2);
+    client.register_agent(&a3);
+    let page = client.get_registered_agents(&0, &2);
+    assert_eq!(page.len(), 2);
+    let all = client.get_registered_agents(&0, &100);
+    assert_eq!(all.len(), 3);
 }
 
 // ── create_escrow ─────────────────────────────────────────────────────────────
