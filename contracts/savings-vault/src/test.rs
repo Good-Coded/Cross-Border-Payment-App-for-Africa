@@ -327,6 +327,77 @@ fn test_cancel_emergency_without_announcement_panics() {
     client.cancel_emergency(&admin);
 }
 
+// ── Issue #764: activate_emergency / deactivate_emergency / emergency_return_funds ──
+
+#[test]
+fn test_activate_emergency_sets_state() {
+    let (env, client, admin, _) = setup();
+    client.activate_emergency(&admin);
+    let event_name: Val = Symbol::new(&env, "EmergencyActivated").into_val(&env);
+    let events = env.events().all();
+    assert!(events.iter().any(|(_, topics, _)| topics.iter().any(|t| t == &event_name)));
+}
+
+#[test]
+fn test_deactivate_emergency_cancels() {
+    let (env, client, admin, _) = setup();
+    client.activate_emergency(&admin);
+    client.deactivate_emergency(&admin);
+    let event_name: Val = Symbol::new(&env, "EmergencyCancelled").into_val(&env);
+    let events = env.events().all();
+    assert!(events.iter().any(|(_, topics, _)| topics.iter().any(|t| t == &event_name)));
+}
+
+#[test]
+#[should_panic(expected = "no emergency active")]
+fn test_deactivate_without_activation_panics() {
+    let (_, client, admin, _) = setup();
+    client.deactivate_emergency(&admin);
+}
+
+#[test]
+fn test_emergency_return_funds_after_48h() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+    let unlock_time = env.ledger().timestamp() + 86400;
+    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    client.deposit(&user, &amount, &unlock_time);
+    client.activate_emergency(&admin);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 172_800);
+    client.emergency_return_funds(&admin, &user);
+    assert_eq!(client.get_balance(&user), 0);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&user), amount);
+    assert_eq!(client.get_total_locked(), 0);
+}
+
+#[test]
+#[should_panic(expected = "emergency return not yet allowed: 48h not elapsed")]
+fn test_emergency_return_funds_before_48h_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+    let unlock_time = env.ledger().timestamp() + 86400;
+    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    client.deposit(&user, &amount, &unlock_time);
+    client.activate_emergency(&admin);
+    client.emergency_return_funds(&admin, &user);
+}
+
+#[test]
+fn test_normal_withdraw_during_emergency_succeeds() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+    let unlock_time = env.ledger().timestamp() + 86400;
+    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    client.deposit(&user, &amount, &unlock_time);
+    client.activate_emergency(&admin);
+    // user can still self-withdraw during emergency window
+    client.withdraw(&user, &amount);
+    assert_eq!(client.get_balance(&user), 0);
+}
+
 // ── #548: interest accrual ────────────────────────────────────────────────────
 
 #[test]

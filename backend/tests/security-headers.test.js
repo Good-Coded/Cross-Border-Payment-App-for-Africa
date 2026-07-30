@@ -78,6 +78,16 @@ describe('Security headers', () => {
     expect(res.headers['content-security-policy']).toContain("script-src 'self'");
   });
 
+  test('CSP does not contain unsafe-inline', async () => {
+    const res = await request(app).get('/health');
+    expect(res.headers['content-security-policy']).not.toContain("'unsafe-inline'");
+  });
+
+  test('CSP contains a per-request nonce in script-src', async () => {
+    const res = await request(app).get('/health');
+    expect(res.headers['content-security-policy']).toMatch(/script-src 'self' 'nonce-[A-Za-z0-9+/]+=*'/);
+  });
+
   test('CSP allows connections to self and Stellar Horizon', async () => {
     const res = await request(app).get('/health');
     const csp = res.headers['content-security-policy'];

@@ -125,7 +125,7 @@ fn test_fee_exactly_10000_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "Fee exceeds maximum of 5000 bps (50%)")]
+#[should_panic(expected = "Fee exceeds maximum of 1000 bps (10%)")]
 fn test_fee_9999_rejected() {
     let (env, client, admin, usdc_id) = setup();
     let sender = Address::generate(&env);
@@ -136,15 +136,50 @@ fn test_fee_9999_rejected() {
 }
 
 #[test]
-fn test_fee_at_max_5000_accepted() {
+fn test_fee_at_max_1000_accepted() {
     let (env, client, admin, usdc_id) = setup();
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
     let amount = 1_000_0000000i128;
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
-    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &5000);
-    assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 5000);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &1000);
+    assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 1000);
+}
+
+#[test]
+#[should_panic(expected = "Fee exceeds maximum of 1000 bps (10%)")]
+fn test_fee_bps_1001_rejected() {
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
+    client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &1001);
+}
+
+#[test]
+#[should_panic(expected = "Amount exceeds maximum escrow amount")]
+fn test_amount_above_max_rejected() {
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let over_max = 10_000_000_000_001i128;
+    mint_usdc(&env, &usdc_id, &admin, &sender, over_max);
+    client.create_escrow(&sender, &recipient, &agent, &over_max, &250);
+}
+
+#[test]
+fn test_amount_at_max_accepted() {
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let max_amount = 10_000_000_000_000i128;
+    mint_usdc(&env, &usdc_id, &admin, &sender, max_amount);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &max_amount, &250);
+    assert_eq!(client.get_escrow(&escrow_id).amount, max_amount);
 }
 
 // ── #560: fuzz-style boundary tests for fee_bps valid range ──────────────────
@@ -174,15 +209,15 @@ fn test_fee_bps_one_accepted() {
 }
 
 #[test]
-fn test_fee_bps_4999_accepted() {
+fn test_fee_bps_999_accepted() {
     let (env, client, admin, usdc_id) = setup();
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
     let amount = 1_000_0000000i128;
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
-    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &4999);
-    assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 4999);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &999);
+    assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 999);
 }
 
 // --- #354: upgrade access control test ---
@@ -209,7 +244,7 @@ fn test_invalid_amount() {
 }
 
 #[test]
-#[should_panic(expected = "Fee exceeds maximum of 5000 bps (50%)")]
+#[should_panic(expected = "Fee exceeds maximum of 1000 bps (10%)")]
 fn test_invalid_fee() {
     let (env, client, admin, usdc_id) = setup();
     let sender = Address::generate(&env);

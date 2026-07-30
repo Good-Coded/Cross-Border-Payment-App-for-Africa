@@ -114,6 +114,8 @@ pub enum DataKey {
     FeeDistributor,
     InterestReserve,
     EmergencyWithdrawalAnnounced,
+    EmergencyActivated,
+    EmergencyActivatedAt,
 }
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
@@ -470,6 +472,106 @@ impl SavingsVaultContract {
         env.events().publish(
             (Symbol::new(&env, "EmergencyCancelled"),),
             EmergencyCancelledEvent { admin, timestamp: now },
+        );
+    }
+
+    /// Activate emergency mode. Admin-only. Sets EmergencyActivated = true and records timestamp.
+    /// Emits EmergencyActivated event. Normal deposit/withdraw remain unblocked.
+    pub fn activate_emergency(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        if env.storage().persistent().get(&DataKey::EmergencyActivated).unwrap_or(false) {
+            panic!("emergency already active");
+        }
+        let now = env.ledger().timestamp();
+        env.storage().persistent().set(&DataKey::EmergencyActivated, &true);
+        env.storage().persistent().set(&DataKey::EmergencyActivatedAt, &now);
+        env.events().publish(
+            (Symbol::new(&env, "EmergencyActivated"),),
+            EmergencyAnnouncedEvent { admin, timestamp: now },
+        );
+    }
+
+    /// Deactivate emergency before the 48-hour window expires. Admin-only.
+    pub fn deactivate_emergency(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        if !env.storage().persistent().get(&DataKey::EmergencyActivated).unwrap_or(false) {
+            panic!("no emergency active");
+        }
+        env.storage().persistent().set(&DataKey::EmergencyActivated, &false);
+        env.storage().persistent().set(&DataKey::EmergencyActivatedAt, &0u64);
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (Symbol::new(&env, "EmergencyCancelled"),),
+            EmergencyCancelledEvent { admin, timestamp: now },
+        );
+    }
+
+    /// Return full vault balance to user. Admin-only, callable only after 48h from activation.
+    /// Normal deposit/withdraw are NOT blocked. Emits EmergencyFundsReturned event.
+    pub fn emergency_return_funds(env: Env, admin: Address, user: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        if !env.storage().persistent().get(&DataKey::EmergencyActivated).unwrap_or(false) {
+            panic!("no emergency active");
+        }
+        let activated_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyActivatedAt)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        if now < activated_at.saturating_add(172_800) {
+            panic!("emergency return not yet allowed: 48h not elapsed");
+        }
+        let vault_key = DataKey::Vault(user.clone());
+        let vault: Vault = env.storage().persistent().get(&vault_key).expect("No vault found for user");
+        if vault.balance <= 0 {
+            panic!("No balance to return");
+        }
+        let amount = vault.balance;
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenAddress)
+            .expect("Contract not initialized");
+        token::Client::new(&env, &token_address).transfer(
+            &env.current_contract_address(),
+            &user,
+            &amount,
+        );
+        env.storage().persistent().remove(&vault_key);
+        let total_locked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLocked)
+            .unwrap_or(0);
+        env.storage().persistent().set(&DataKey::TotalLocked, &(total_locked - amount));
+        env.events().publish(
+            (Symbol::new(&env, "EmergencyFundsReturned"),),
+            EmergencyWithdrawnEvent { admin, user, amount, timestamp: now },
         );
     }
 

@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -62,11 +63,15 @@ app.use((req, res, next) => {
 });
 app.use(metricsMiddleware);
 app.use(cookieParser());
-app.use(helmet({
+app.use((req, res, next) => {
+  res.locals.cspNonce = crypto.randomBytes(16).toString('base64');
+  next();
+});
+app.use((req, res, next) => helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'none'"],
-      scriptSrc: ["'self'"],
+      scriptSrc: ["'self'", `'nonce-${res.locals.cspNonce}'`],
       connectSrc: ["'self'", 'https://horizon.stellar.org', 'wss://horizon.stellar.org'],
       imgSrc: ["'self'", 'data:'],
       frameAncestors: ["'none'"],
@@ -85,7 +90,7 @@ app.use(helmet({
     geolocation: [],
     payment: [],
   },
-}));
+})(req, res, next));
 app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true, maxAge: 86400 }));
 app.use(express.json());
 

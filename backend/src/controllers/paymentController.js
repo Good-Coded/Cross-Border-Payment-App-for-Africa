@@ -204,7 +204,8 @@ async function estimateFee(req, res, next) {
 
 /**
  * GET /api/payments/estimate-fees?amount=100&asset=USDC
- * Returns a pre-submission fee breakdown without processing a payment.
+ * Queries fee rate from fee-distributor contract via Horizon simulate (read-only).
+ * Falls back to Redis cache, then PLATFORM_FEE_BPS env var.
  */
 async function estimateFees(req, res, next) {
   try {
@@ -216,10 +217,65 @@ async function estimateFees(req, res, next) {
     if (!VALID.includes(asset)) {
       return res.status(400).json({ error: `asset must be one of: ${VALID.join(", ")}` });
     }
+
+    const CACHE_KEY = 'fee_rate_bps_onchain';
+    const CACHE_TTL = 60; // 60-second TTL per issue #765
+    let feeBps = null;
+    let feeRateSource = 'on-chain';
+    let lastFetchedAt = new Date().toISOString();
+
+    // 1. Try on-chain via Horizon simulate
+    try {
+      const contractId = process.env.FEE_DISTRIBUTOR_CONTRACT_ID;
+      if (contractId) {
+        const axios = require('axios');
+        const horizonUrl = process.env.STELLAR_HORIZON_URL || 'https://horizon-testnet.stellar.org';
+        const { data } = await axios.post(`${horizonUrl}/simulate_transaction`, {
+          contract_id: contractId,
+          function_name: 'get_fee_rate',
+          args: [],
+        }, { timeout: 5000 });
+        const onChainBps = data?.result ?? data?.return_value;
+        if (onChainBps != null) {
+          feeBps = parseInt(onChainBps, 10);
+          await cache.set(CACHE_KEY, feeBps, CACHE_TTL);
+          lastFetchedAt = new Date().toISOString();
+        }
+      }
+    } catch (_) {
+      feeRateSource = 'cached';
+    }
+
+    // 2. Fall back to Redis cache
+    if (feeBps == null) {
+      const cached = await cache.get(CACHE_KEY);
+      if (cached != null) {
+        feeBps = parseInt(cached, 10);
+        feeRateSource = 'cached';
+      }
+    }
+
+    // 3. Fall back to env var
+    if (feeBps == null) {
+      feeBps = FALLBACK_PLATFORM_FEE_BPS;
+      feeRateSource = 'config_fallback';
+      logger.warn('Fee rate falling back to PLATFORM_FEE_BPS env var', { feeBps });
+    }
+
     let stellarFeeStroops = null;
     try { stellarFeeStroops = await fetchFee(); } catch (_) { /* non-fatal */ }
     const breakdown = await buildFeeBreakdown(amount, asset, stellarFeeStroops);
-    res.json({ fee_breakdown: breakdown });
+    // Override fee_bps with the on-chain/cached value
+    breakdown.platform_fee_bps = feeBps;
+    breakdown.platform_fee_usdc = parseFloat((parseFloat(amount) * feeBps / 10000).toFixed(7));
+    breakdown.net_amount_usdc = parseFloat((parseFloat(amount) - breakdown.platform_fee_usdc).toFixed(7));
+
+    res.json({
+      fee_breakdown: breakdown,
+      fee_rate_bps: feeBps,
+      fee_rate_source: feeRateSource,
+      last_fetched_at: lastFetchedAt,
+    });
   } catch (err) {
     next(err);
   }
