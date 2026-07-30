@@ -30,9 +30,20 @@ pub enum KycTier {
 pub enum DataKey {
     Admin,
     TieredAttestation(Address, KycTier),
+    Attestation(Address),
+    AttestationByTier(Address, KycTier),
 }
 
 // ── Domain types ──────────────────────────────────────────────────────────────
+
+/// Supported KYC tiers for attestation records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum KycTier {
+    Basic,
+    Standard,
+    Premium,
+}
 
 /// On-chain KYC attestation record.
 #[derive(Clone)]
@@ -51,6 +62,21 @@ pub struct Attestation {
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+#[contracttype]
+pub struct AttestationRevoked {
+    pub user: Address,
+    pub tier: KycTier,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchRevocationCompleted {
+    pub count: u32,
+    pub admin: Address,
+    pub timestamp: u64,
+}
 
 #[contract]
 pub struct KycAttestationContract;
@@ -110,6 +136,13 @@ impl KycAttestationContract {
             expires_at,
         };
         env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Attestation(user.clone()), &record);
+        env.storage().persistent().set(
+            &DataKey::AttestationByTier(user.clone(), KycTier::Basic),
+            &record,
+        );
 
         env.events().publish((Symbol::new(&env, "KycAttested"),), (user, tier));
     }
@@ -139,6 +172,13 @@ impl KycAttestationContract {
 
         record.revoked_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Attestation(user.clone()), &record);
+        env.storage().persistent().set(
+            &DataKey::AttestationByTier(user.clone(), KycTier::Basic),
+            &record,
+        );
 
         env.events().publish((Symbol::new(&env, "KycRevoked"),), (user, tier));
     }
@@ -207,6 +247,70 @@ impl KycAttestationContract {
     }
 
     /// Return the full attestation record for `user` and `tier`, or panic if none exists.
+    /// Revoke a batch of wallet-tier attestations in a single invocation.
+    ///
+    /// Only the admin may call this. Missing or already-revoked entries are
+    /// skipped silently, while a batch larger than 50 entries panics.
+    pub fn batch_revoke(env: Env, admin: Address, revocations: soroban_sdk::Vec<(Address, KycTier)>) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        if revocations.len() > 50 {
+            panic!("Batch size exceeds maximum of 50");
+        }
+
+        let now = env.ledger().timestamp();
+        let mut revoked_count = 0u32;
+
+        for revocation in revocations.iter() {
+            let (user, tier) = revocation;
+            let legacy_key = DataKey::Attestation(user.clone());
+            let tiered_key = DataKey::AttestationByTier(user.clone(), tier);
+
+            let (key, mut record) = match env
+                .storage()
+                .persistent()
+                .get::<_, Attestation>(&tiered_key)
+            {
+                Some(record) => (tiered_key, record),
+                None => match env.storage().persistent().get::<_, Attestation>(&legacy_key) {
+                    Some(record) => (legacy_key, record),
+                    None => continue,
+                },
+            };
+
+            if record.revoked_at != 0 {
+                continue;
+            }
+
+            record.revoked_at = now;
+            env.storage().persistent().set(&key, &record);
+            revoked_count += 1;
+
+            env.events().publish(
+                (Symbol::new(&env, "KycRevoked"),),
+                user.clone(),
+            );
+            env.events().publish(
+                (Symbol::new(&env, "AttestationRevoked"),),
+                AttestationRevoked {
+                    user: user.clone(),
+                    tier,
+                },
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "BatchRevocationCompleted"),),
+            BatchRevocationCompleted {
+                count: revoked_count,
+                admin: admin.clone(),
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Return the full attestation record for `user`, or panic if none exists.
     ///
     /// # Arguments
     /// * `user` — Stellar address to look up.

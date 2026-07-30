@@ -71,6 +71,12 @@ pub enum DataKey {
     Arbitrators,
     /// Required majority threshold in basis points (e.g. 6001 = >60 %).
     QuorumBps,
+    /// The filing fee (in stroops) required to open a dispute.
+    FilingFee,
+    /// Address that receives forfeited filing fees when the opener loses.
+    FeeDistributorAddress,
+    /// The address that paid the filing fee for a given dispute.
+    FilingFeeHolder(u64),
     /// Individual vote cast by one panel arbitrator on a dispute.
     /// Value is `bool`: `true` = for recipient, `false` = for sender.
     Vote(u64, Address),
@@ -224,6 +230,8 @@ impl DisputeResolutionContract {
         env.storage().persistent().set(&DataKey::MaxEvidenceBytes, &max_evidence_bytes);
         env.storage().persistent().set(&DataKey::Counter, &0u64);
         env.storage().persistent().set(&DataKey::SuperArbitrator, &super_arbitrator);
+        env.storage().persistent().set(&DataKey::FilingFee, &50_000000i128);
+        env.storage().persistent().set(&DataKey::FeeDistributorAddress, &admin);
         // Initialise the arbitrator panel with an empty list and the default quorum.
         let empty: Vec<Address> = Vec::new(&env);
         env.storage().persistent().set(&DataKey::Arbitrators, &empty);
@@ -262,12 +270,24 @@ impl DisputeResolutionContract {
             .get(&DataKey::UsdcAddress)
             .expect("not initialized");
 
-        // Lock funds in the contract for the duration of the dispute
-        token::Client::new(&env, &usdc).transfer(
-            &opener,
-            &env.current_contract_address(),
-            &amount,
-        );
+        let filing_fee: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FilingFee)
+            .unwrap_or(50_000000);
+        let token_client = token::Client::new(&env, &usdc);
+        let balance = token_client.balance(&opener);
+        if balance < filing_fee {
+            panic!("Insufficient balance for dispute filing fee");
+        }
+        if balance < amount + filing_fee {
+            panic!("insufficient balance");
+        }
+
+        // Lock both the dispute amount and the filing fee in the contract
+        // for the duration of the dispute.
+        token_client.transfer(&opener, &env.current_contract_address(), &filing_fee);
+        token_client.transfer(&opener, &env.current_contract_address(), &amount);
 
         let id: u64 = env
             .storage()
@@ -294,6 +314,9 @@ impl DisputeResolutionContract {
             resolved_for_recipient: false,
         };
         env.storage().persistent().set(&DataKey::Dispute(id), &dispute);
+        env.storage()
+            .persistent()
+            .set(&DataKey::FilingFeeHolder(id), &opener);
 
         env.events().publish(
             (Symbol::new(&env, "DisputeOpened"),),
@@ -494,6 +517,7 @@ impl DisputeResolutionContract {
             dispute.sender.clone()
         };
 
+        Self::settle_filing_fee(&env, dispute_id, &winner, &usdc);
         token::Client::new(&env, &usdc).transfer(
             &env.current_contract_address(),
             &winner,
@@ -563,6 +587,7 @@ impl DisputeResolutionContract {
             dispute.sender.clone()
         };
 
+        Self::settle_filing_fee(&env, dispute_id, &winner, &usdc);
         token::Client::new(&env, &usdc).transfer(
             &env.current_contract_address(),
             &winner,
@@ -630,6 +655,67 @@ impl DisputeResolutionContract {
                 refund_amount: dispute.amount,
             },
         );
+    }
+
+    /// Update the filing fee required to open a dispute. Admin only.
+    pub fn update_filing_fee(env: Env, admin: Address, new_fee: i128) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        if new_fee > 500_000_000 {
+            panic!("filing fee exceeds maximum of 50 USDC");
+        }
+        env.storage().persistent().set(&DataKey::FilingFee, &new_fee);
+    }
+
+    /// Update the address that receives forfeited filing fees. Admin only.
+    pub fn set_fee_distributor_address(env: Env, admin: Address, fee_distributor: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeDistributorAddress, &fee_distributor);
+    }
+
+    fn settle_filing_fee(env: &Env, dispute_id: u64, winner: &Address, usdc: &Address) {
+        let fee_amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FilingFee)
+            .unwrap_or(50_000000);
+        if fee_amount <= 0 {
+            return;
+        }
+
+        if let Some(holder) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FilingFeeHolder(dispute_id))
+        {
+            if winner == &holder {
+                token::Client::new(env, usdc).transfer(
+                    &env.current_contract_address(),
+                    winner,
+                    &fee_amount,
+                );
+            } else {
+                let fee_distributor: Address = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::FeeDistributorAddress)
+                    .expect("fee distributor not configured");
+                token::Client::new(env, usdc).transfer(
+                    &env.current_contract_address(),
+                    &fee_distributor,
+                    &fee_amount,
+                );
+            }
+        }
     }
 
     /// Return the full dispute record for the given ID.
@@ -804,6 +890,7 @@ impl DisputeResolutionContract {
                 dispute.sender.clone()
             };
 
+            Self::settle_filing_fee(&env, dispute_id, &winner, &usdc);
             token::Client::new(&env, &usdc).transfer(
                 &env.current_contract_address(),
                 &winner,

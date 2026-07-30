@@ -223,6 +223,46 @@ fn test_transfer_moves_points_between_accounts() {
 }
 
 #[test]
+fn test_create_snapshot_records_balances_for_registered_holders() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    client.mint(&admin, &user, &150);
+    let snapshot_id = client.create_snapshot(&admin);
+    assert_eq!(snapshot_id, 1);
+    assert_eq!(client.snapshot_balance(&snapshot_id, &user), 150);
+}
+
+#[test]
+fn test_snapshot_balance_reflects_balance_before_transfer() {
+    let (env, client, admin) = setup();
+    let sender = Address::generate(&env);
+    let receiver = Address::generate(&env);
+    client.mint(&admin, &sender, &100);
+    let snapshot_id = client.create_snapshot(&admin);
+    client.transfer(&sender, &receiver, &30);
+    assert_eq!(client.snapshot_balance(&snapshot_id, &sender), 100);
+    assert_eq!(client.snapshot_balance(&snapshot_id, &receiver), 0);
+    assert_eq!(client.balance(&sender), 70);
+}
+
+#[test]
+#[should_panic(expected = "Snapshot limit reached")]
+fn test_snapshot_limit_enforced() {
+    let (env, client, admin) = setup();
+    for _ in 0..11 {
+        let _ = client.create_snapshot(&admin);
+    }
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: caller is not admin")]
+fn test_create_snapshot_non_admin_panics() {
+    let (env, client, _) = setup();
+    let impostor = Address::generate(&env);
+    client.create_snapshot(&impostor);
+}
+
+#[test]
 #[should_panic(expected = "insufficient balance")]
 fn test_transfer_insufficient_balance_panics() {
     let (env, client, admin) = setup();
