@@ -84,44 +84,6 @@ router.get('/stellar-stats', getStellarNetworkStats);
 router.post('/assets/issue', issueTokens);
 
 router.post('/clawback',
- *   post:
- *     summary: Clawback an asset from a user account (admin only)
- *     description: >
- *       Regulatory compliance operation. Reclaims a Stellar asset (e.g. USDC)
- *       from a user's account. Requires the asset issuer to have
- *       AUTH_CLAWBACK_ENABLED_FLAG set. All operations are audit-logged.
- *     tags: [Admin]
- *     security:
- *       - bearerAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [from, asset, amount]
- *             properties:
- *               from:
- *                 type: string
- *                 description: Stellar public key of the account to clawback from
- *               asset:
- *                 type: string
- *                 description: Asset code (e.g. USDC)
- *               amount:
- *                 type: string
- *                 description: Amount to clawback
- *               reason:
- *                 type: string
- *                 description: Reason for clawback (fraud, court order, etc.)
- *     responses:
- *       200:
- *         description: Clawback executed
- *       400:
- *         description: Validation error
- *       403:
- *         description: Admin access required
- */
-router.post('/clawback',
   [
     body('from')
       .notEmpty().withMessage('from address is required')

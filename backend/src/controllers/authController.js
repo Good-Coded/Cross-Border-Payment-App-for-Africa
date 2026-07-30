@@ -8,8 +8,6 @@ const logger = require('../utils/logger');
 const { hashPIN, comparePIN, validatePIN } = require('../services/pin');
 const { sendVerificationEmail, sendPasswordResetEmail, sendBackupCodeWarningEmail } = require('../services/email');
 const { generateSecret, verifyToken, generateBackupCodes, useBackupCode, hashBackupCode, verifyBackupCode } = require('../services/twofa');
-const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email');
-const { generateSecret, verifyToken, generateBackupCodes } = require('../services/twofa');
 const {
   COOKIE_NAME,
   COOKIE_OPTIONS,
@@ -24,8 +22,8 @@ const cache = require('../utils/cache');
 
 const { sendOTP } = require('../services/sms');
 const { recordSession, invalidateOtherSessions } = require('./sessionController');
-const { recordSession } = require('./sessionController');
 
+const TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — email verification tokens
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 const PHONE_OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -153,7 +151,6 @@ async function register(req, res, next) {
 
     await sendVerificationEmail(email, raw);
 
-    res.status(201).json({ message: 'Account created. Please verify your email before logging in.' });
     if (phone && otpRaw) {
       sendOTP(phone, otpRaw).catch(e => logger.warn('Registration OTP SMS failed', { error: e.message }));
     }
@@ -284,24 +281,15 @@ async function login(req, res, next) {
           sendBackupCodeWarningEmail(emailRow.rows[0].email, parseInt(remaining.rows[0].count, 10)).catch(() => {});
         }
       } else {
-        if (!verifyToken(user.totp_secret, totpCode)) {
-    // 2FA check — must happen before issuing tokens
-    if (user.totp_enabled) {
-      // Check if the incoming device trust token allows skipping TOTP
-      let deviceTrusted = false;
-      if (incomingDeviceToken) {
-        try {
-          const payload = verifyDeviceToken(incomingDeviceToken);
-          deviceTrusted = String(payload.userId) === String(user.id);
-        } catch { /* expired or invalid — fall through to TOTP */ }
-      }
-
-      if (!deviceTrusted) {
-        if (!totp_code) {
-          return res.status(403).json({ error: 'TOTP code required', requires_2fa: true });
+        // Device trust token allows skipping TOTP on a previously trusted device.
+        let deviceTrusted = false;
+        if (incomingDeviceToken) {
+          try {
+            const payload = verifyDeviceToken(incomingDeviceToken);
+            deviceTrusted = String(payload.userId) === String(user.id);
+          } catch { /* expired or invalid — require TOTP */ }
         }
-        const isValid = verifyToken(user.totp_secret, totp_code);
-        if (!isValid) {
+        if (!deviceTrusted && !verifyToken(user.totp_secret, totpCode)) {
           return res.status(401).json({ error: 'Invalid TOTP code' });
         }
       }
@@ -603,10 +591,6 @@ async function setPIN(req, res, next) {
       `UPDATE users SET pin_hash = $1, pin_setup_completed = true WHERE id = $2`,
       [pinHash, userId]
     );
-    await db.query(`UPDATE users SET pin_hash = $1, pin_setup_completed = true WHERE id = $2`, [
-      pinHash,
-      userId,
-    ]);
 
     res.json({ message: 'PIN set successfully' });
   } catch (err) {
@@ -987,6 +971,11 @@ async function changePassword(req, res, next) {
 
     audit.log(userId, 'password_change', req.ip, req.headers['user-agent']);
     res.json({ message: 'Password changed successfully' });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // Magic-bytes signatures for allowed image types
 const IMAGE_MAGIC = [
   { mime: 'image/jpeg', bytes: [0xff, 0xd8, 0xff] },
@@ -1038,7 +1027,6 @@ async function uploadAvatar(req, res, next) {
   }
 }
 
-module.exports = { register, login, verifyEmail, getMe, setPIN, verifyPIN };
 module.exports = {
   register,
   login,
