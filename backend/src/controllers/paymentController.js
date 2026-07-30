@@ -27,6 +27,7 @@ const { persistAndBroadcast } = require("../services/notificationInbox");
 >>>>>>> main
 const { checkVelocity, checkDailyLimit } = require("../services/fraudDetection");
 const { checkFraud, logFraudBlock } = require("../services/fraudDetection");
+const { withLock } = require("../utils/distributedLock");
 const { parseHistoryFrom, parseHistoryTo, normalizeAsset, validateDateRange } = require("../utils/historyQuery");
 const { isMemoRequired } = require("../services/memoRequired");
 const { creditReferralReward } = require("../services/referralRewardService");
@@ -396,76 +397,84 @@ async function send(req, res, next) {
       return res.status(400).json({ error: "Cannot send payment to your own wallet" });
     }
 
-    const overLimit = await dailyLimitExceeded(public_key, amount);
-    if (overLimit) {
-      webhook.deliver("payment.failed", { code: "DAILY_LIMIT_EXCEEDED", error: `Daily send limit of ${DAILY_SEND_LIMIT} reached. Try again tomorrow.` }).catch(() => {});
-      return res.status(400).json({
-        error: `Daily send limit of ${DAILY_SEND_LIMIT} reached. Try again tomorrow.`,
-        code: "DAILY_LIMIT_EXCEEDED",
+    // Use a per-wallet distributed lock to prevent concurrent sends from
+    // racing past the daily-limit check (issue #888).
+    const lockKey = `daily_limit:${public_key}`;
+    let txResult;
+    const lockAcquired = await withLock(lockKey, 10, async () => {
+      const overLimit = await dailyLimitExceeded(public_key, amount);
+      if (overLimit) {
+        throw Object.assign(new Error(`Daily send limit of ${DAILY_SEND_LIMIT} reached. Try again tomorrow.`), {
+          status: 400, payload: { code: "DAILY_LIMIT_EXCEEDED" },
+        });
+      }
+
+      // Fraud protection — velocity and daily limit (single authoritative check)
+      const [isSuspicious, limitExceeded] = await Promise.all([
+        checkVelocity(public_key),
+        checkDailyLimit(public_key, amount, asset),
+      ]);
+      if (isSuspicious) {
+        throw Object.assign(new Error("Transaction limit reached. Please wait before sending again."), { status: 429 });
+      }
+      const fraudCheck = await checkFraud(public_key, amount, asset);
+      if (fraudCheck.blocked) {
+        await logFraudBlock(public_key, fraudCheck.reason, amount, asset);
+        throw Object.assign(new Error(fraudCheck.reason), { status: 429 });
+      }
+
+      if (await isMemoRequired(recipient_address) && !memo) {
+        throw Object.assign(new Error("This address requires a memo to route your payment correctly. Please include a memo."), {
+          status: 422, payload: { code: "MEMO_REQUIRED" },
+        });
+      }
+      if (limitExceeded) {
+        throw Object.assign(new Error("Daily send limit reached. Try again later."), {
+          status: 429, payload: { code: "DAILY_LIMIT_EXCEEDED" },
+        });
+      }
+
+      // Balance check — fail fast with a clear message before hitting Stellar
+      await checkSufficientBalance(public_key, amount, asset);
+
+      // Broadcast to Stellar
+      const { transactionHash, ledger, type, claimableBalanceId, feeCharged } = await sendPayment({
+        senderPublicKey: public_key,
+        encryptedSecretKey: encrypted_secret_key,
+        recipientPublicKey: recipient_address,
+        amount,
+        asset,
+        memo: memo || undefined,
+        memoType: memo ? memo_type : undefined,
+        feePriority: fee_priority,
+      }, req.logger);
+
+      const ledger_close_time = await fetchLedgerCloseTime(ledger);
+
+      // Build fee breakdown
+      const fee_breakdown = await buildFeeBreakdown(amount, asset, feeCharged ?? null);
+
+      // Save to DB
+      const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
+      await db.query(
+        `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(fee_breakdown)],
+      );
+
+      txResult = { transactionHash, ledger, type, claimableBalanceId, fee_breakdown, txStatus };
+    });
+
+    if (!lockAcquired) {
+      // Lock was held by another request — treat as rate-limited
+      return res.status(429).json({
+        error: "Too many concurrent payment requests. Please try again.",
+        code: "CONCURRENCY_LIMIT",
       });
     }
 
-    // Fraud protection — velocity and daily limit (single authoritative check)
-    const [isSuspicious, limitExceeded] = await Promise.all([
-      checkVelocity(public_key),
-      checkDailyLimit(public_key, amount, asset),
-    ]);
-    if (isSuspicious) {
-      webhook.deliver("payment.failed", { code: "FRAUD_BLOCKED", error: "Transaction limit reached. Please wait before sending again." }).catch(() => {});
-      return res
-        .status(429)
-        .json({ error: "Transaction limit reached. Please wait before sending again." });
-    }
-    const fraudCheck = await checkFraud(public_key, amount, asset);
-    if (fraudCheck.blocked) {
-      await logFraudBlock(public_key, fraudCheck.reason, amount, asset);
-      webhook.deliver("payment.failed", { code: "FRAUD_BLOCKED", error: fraudCheck.reason }).catch(() => {});
-      return res.status(429).json({ error: fraudCheck.reason });
-    }
-
-    if (await isMemoRequired(recipient_address) && !memo) {
-      return res.status(422).json({
-        error: "This address requires a memo to route your payment correctly. Please include a memo.",
-        code: "MEMO_REQUIRED",
-      });
-    }
-    if (limitExceeded) {
-      webhook.deliver("payment.failed", { code: "DAILY_LIMIT_EXCEEDED", error: "Daily send limit reached. Try again later." }).catch(() => {});
-      return res
-        .status(429)
-        .json({ error: "Daily send limit reached. Try again later.", code: "DAILY_LIMIT_EXCEEDED" });
-    }
-
-    // Balance check — fail fast with a clear message before hitting Stellar
-    await checkSufficientBalance(public_key, amount, asset);
-
-    // Broadcast to Stellar
-    const { transactionHash, ledger, type, claimableBalanceId, feeCharged } = await sendPayment({
-      senderPublicKey: public_key,
-      encryptedSecretKey: encrypted_secret_key,
-      recipientPublicKey: recipient_address,
-      amount,
-      asset,
-      memo: memo || undefined,
-      memoType: memo ? memo_type : undefined,
-      feePriority: fee_priority,
-    }, req.logger);
-
-    const ledger_close_time = await fetchLedgerCloseTime(ledger);
-
-    // Build fee breakdown
-    const fee_breakdown = await buildFeeBreakdown(amount, asset, feeCharged ?? null);
-
-    // Save to DB
-    const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
-    await db.query(
-      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-      [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(fee_breakdown)],
-    );
-
-    if (type !== "claimable_balance") {
-      pollTransactionConfirmation(txId, transactionHash).catch(() => {});
+    if (txResult.type !== "claimable_balance") {
+      pollTransactionConfirmation(txId, txResult.transactionHash).catch(() => {});
     }
 
     await cache.del(`balance:${public_key}`);
@@ -481,8 +490,8 @@ async function send(req, res, next) {
     // Queue loyalty mint for background processing after confirmation
     enqueueLoyaltyMint(txId, req.user.userId, public_key, amount, asset).catch(() => {});
 
-    if (asset === "USDC" && fee_breakdown.platform_fee_bps > 0) {
-      const feeStroops = Math.floor(parseFloat(amount) * 1e7 * fee_breakdown.platform_fee_bps / 10000);
+    if (asset === "USDC" && txResult.fee_breakdown.platform_fee_bps > 0) {
+      const feeStroops = Math.floor(parseFloat(amount) * 1e7 * txResult.fee_breakdown.platform_fee_bps / 10000);
       if (feeStroops > 0) {
         depositFee(feeStroops).catch((err) =>
           logger.warn("Fee deposit failed (non-critical):", { error: err.message }),
@@ -490,14 +499,14 @@ async function send(req, res, next) {
       }
     }
 
-    const txData = { id: txId, tx_hash: transactionHash, ledger, amount, asset, sender: public_key, recipient: recipient_address, type };
+    const txData = { id: txId, tx_hash: txResult.transactionHash, ledger: txResult.ledger, amount, asset, sender: public_key, recipient: recipient_address, type: txResult.type };
     webhook.deliver("payment.sent", txData).catch(() => {});
-    if (type !== "claimable_balance") {
+    if (txResult.type !== "claimable_balance") {
       webhook.deliver("payment.received", txData).catch(() => {});
     }
 
     // Fire-and-forget email notifications
-    const emailTxData = { amount, asset, senderAddress: public_key, recipientAddress: recipient_address, memo: memo || null, txHash: transactionHash };
+    const emailTxData = { amount, asset, senderAddress: public_key, recipientAddress: recipient_address, memo: memo || null, txHash: txResult.transactionHash };
     db.query("SELECT email FROM users WHERE id = $1", [req.user.userId])
       .then(({ rows }) => rows[0] && sendTransactionEmail(rows[0].email, "sent", emailTxData))
       .catch(() => {});
@@ -527,17 +536,17 @@ async function send(req, res, next) {
     }).catch(() => {});
 
     res.json({
-      message: type === "claimable_balance" ? "Claimable balance created" : "Payment sent successfully",
+      message: txResult.type === "claimable_balance" ? "Claimable balance created" : "Payment sent successfully",
       transaction: {
         id: txId,
-        tx_hash: transactionHash,
-        ledger,
+        tx_hash: txResult.transactionHash,
+        ledger: txResult.ledger,
         amount,
         asset,
         recipient: recipient_address,
-        type,
-        claimableBalanceId,
-        fee_breakdown,
+        type: txResult.type,
+        claimableBalanceId: txResult.claimableBalanceId,
+        fee_breakdown: txResult.fee_breakdown,
       },
     });
   } catch (err) {

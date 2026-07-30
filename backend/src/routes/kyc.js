@@ -1,5 +1,6 @@
 const router = require("express").Router();
 const multer = require("multer");
+const rateLimit = require("express-rate-limit");
 const { body, validationResult } = require("express-validator");
 const authMiddleware = require("../middleware/auth");
 const kycUpload = require("../middleware/kycUpload");
@@ -22,12 +23,26 @@ const upload = (req, res, next) => {
   });
 };
 
+// Rate limiter for KYC submissions — prevents abuse of file upload + AML screening
+const kycSubmissionLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: parseInt(process.env.KYC_SUBMIT_RATE_LIMIT || "5", 10),
+  keyGenerator: (req) => req.user.userId,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipFailedRequests: true,
+  message: {
+    error: "Too many KYC submissions. You may submit up to 5 per hour.",
+  },
+});
+
 router.use(authMiddleware);
 
 router.get("/status", getKYCStatus);
 
 router.post(
   "/submit",
+  kycSubmissionLimiter,
   upload,
   [
     body("id_type").notEmpty().withMessage("ID type is required"),
