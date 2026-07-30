@@ -17,9 +17,19 @@ mod test;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
+#[contracttype]
+#[repr(u32)]
+pub enum KycTier {
+    Basic = 0,
+    Enhanced = 1,
+    Business = 2,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
+    TieredAttestation(Address, KycTier),
     Attestation(Address),
     AttestationByTier(Address, KycTier),
 }
@@ -95,7 +105,14 @@ impl KycAttestationContract {
     /// * `kyc_hash`   — SHA-256 hash of the KYC document bundle. Never raw PII.
     /// * `expires_at` — Ledger timestamp after which the attestation expires.
     ///                  Pass 0 for no expiry.
-    pub fn attest(env: Env, admin: Address, user: Address, kyc_hash: Bytes, expires_at: u64) {
+    pub fn attest(
+        env: Env,
+        admin: Address,
+        user: Address,
+        tier: KycTier,
+        kyc_hash: Bytes,
+        expires_at: u64,
+    ) {
         admin.require_auth();
         Self::assert_admin(&env, &admin);
 
@@ -103,14 +120,12 @@ impl KycAttestationContract {
             panic!("kyc_hash must not be empty");
         }
 
-        // Prevent overwriting an active attestation
-        if let Some(existing) = env
-            .storage()
-            .persistent()
-            .get::<_, Attestation>(&DataKey::Attestation(user.clone()))
-        {
+        let key = DataKey::TieredAttestation(user.clone(), tier.clone());
+
+        // Prevent overwriting an active attestation for the same tier
+        if let Some(existing) = env.storage().persistent().get::<_, Attestation>(&key) {
             if existing.revoked_at == 0 {
-                panic!("user already has an active attestation");
+                panic!("user already has an active attestation for this tier");
             }
         }
 
@@ -120,6 +135,7 @@ impl KycAttestationContract {
             revoked_at: 0,
             expires_at,
         };
+        env.storage().persistent().set(&key, &record);
         env.storage()
             .persistent()
             .set(&DataKey::Attestation(user.clone()), &record);
@@ -128,34 +144,34 @@ impl KycAttestationContract {
             &record,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "KycAttested"),),
-            user,
-        );
+        env.events().publish((Symbol::new(&env, "KycAttested"),), (user, tier));
     }
 
-    /// Revoke an existing attestation for `user`.
+    /// Revoke an existing attestation for `user` and `tier`.
     ///
     /// Only the admin may call this. Panics if no active attestation exists.
     ///
     /// # Arguments
     /// * `admin` — Must match the admin set during `initialize`.
     /// * `user`  — Stellar address whose attestation should be revoked.
-    pub fn revoke(env: Env, admin: Address, user: Address) {
+    /// * `tier`  — KYC tier to revoke.
+    pub fn revoke(env: Env, admin: Address, user: Address, tier: KycTier) {
         admin.require_auth();
         Self::assert_admin(&env, &admin);
 
+        let key = DataKey::TieredAttestation(user.clone(), tier.clone());
         let mut record: Attestation = env
             .storage()
             .persistent()
-            .get(&DataKey::Attestation(user.clone()))
-            .expect("no attestation found for user");
+            .get(&key)
+            .expect("no attestation found for user and tier");
 
         if record.revoked_at != 0 {
             panic!("attestation already revoked");
         }
 
         record.revoked_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
         env.storage()
             .persistent()
             .set(&DataKey::Attestation(user.clone()), &record);
@@ -164,23 +180,21 @@ impl KycAttestationContract {
             &record,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "KycRevoked"),),
-            user,
-        );
+        env.events().publish((Symbol::new(&env, "KycRevoked"),), (user, tier));
     }
 
-    /// Returns `true` if `user` has a current, non-revoked, non-expired KYC attestation.
+    /// Returns `true` if `user` has a current, non-revoked, non-expired KYC attestation for `tier`.
     ///
     /// Public — any caller may invoke this.
     ///
     /// # Arguments
     /// * `user` — Stellar address to check.
-    pub fn is_verified(env: Env, user: Address) -> bool {
+    /// * `tier` — KYC tier to verify.
+    pub fn is_verified(env: Env, user: Address, tier: KycTier) -> bool {
         match env
             .storage()
             .persistent()
-            .get::<_, Attestation>(&DataKey::Attestation(user))
+            .get::<_, Attestation>(&DataKey::TieredAttestation(user, tier))
         {
             Some(record) => {
                 if record.revoked_at != 0 {
@@ -193,6 +207,16 @@ impl KycAttestationContract {
             }
             None => false,
         }
+    }
+
+    /// Returns the highest verified tier for `user`, or `None` if no tier is verified.
+    pub fn get_highest_tier(env: Env, user: Address) -> Option<KycTier> {
+        for tier in [KycTier::Business, KycTier::Enhanced, KycTier::Basic] {
+            if Self::is_verified(env.clone(), user.clone(), tier.clone()) {
+                return Some(tier);
+            }
+        }
+        None
     }
 
     /// Revoke attestations for multiple users atomically.
@@ -209,24 +233,20 @@ impl KycAttestationContract {
 
         let now = env.ledger().timestamp();
         for user in users.iter() {
-            let key = DataKey::Attestation(user.clone());
-            if let Some(mut record) = env
-                .storage()
-                .persistent()
-                .get::<_, Attestation>(&key)
-            {
-                if record.revoked_at == 0 {
-                    record.revoked_at = now;
-                    env.storage().persistent().set(&key, &record);
-                    env.events().publish(
-                        (Symbol::new(&env, "KycRevoked"),),
-                        user,
-                    );
+            for tier in [KycTier::Basic, KycTier::Enhanced, KycTier::Business] {
+                let key = DataKey::TieredAttestation(user.clone(), tier.clone());
+                if let Some(mut record) = env.storage().persistent().get::<_, Attestation>(&key) {
+                    if record.revoked_at == 0 {
+                        record.revoked_at = now;
+                        env.storage().persistent().set(&key, &record);
+                        env.events().publish((Symbol::new(&env, "KycRevoked"),), (user.clone(), tier));
+                    }
                 }
             }
         }
     }
 
+    /// Return the full attestation record for `user` and `tier`, or panic if none exists.
     /// Revoke a batch of wallet-tier attestations in a single invocation.
     ///
     /// Only the admin may call this. Missing or already-revoked entries are
@@ -294,11 +314,12 @@ impl KycAttestationContract {
     ///
     /// # Arguments
     /// * `user` — Stellar address to look up.
-    pub fn get_attestation(env: Env, user: Address) -> Attestation {
+    /// * `tier` — KYC tier to look up.
+    pub fn get_attestation(env: Env, user: Address, tier: KycTier) -> Attestation {
         env.storage()
             .persistent()
-            .get(&DataKey::Attestation(user))
-            .expect("no attestation found for user")
+            .get(&DataKey::TieredAttestation(user, tier))
+            .expect("no attestation found for user and tier")
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

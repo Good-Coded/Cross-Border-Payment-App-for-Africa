@@ -288,18 +288,21 @@ fn test_pause_sets_status_paused() {
 }
 
 #[test]
-fn test_resume_sets_status_active() {
+fn test_resume_sets_status_active_and_updates_next_payment_at() {
     let (env, contract_id, _, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let before = env.ledger().timestamp();
     client.pause_recurring_payment(&sender, &id);
+    advance_time(&env, 86400);
     client.resume_recurring_payment(&sender, &id);
     let s = client.get_recurring_payment(&id);
     assert_eq!(s.status, ScheduleStatus::Active);
+    assert_eq!(s.next_payment_at, before + 86400 + 86400);
 }
 
 #[test]
-#[should_panic(expected = "schedule is not active")]
+#[should_panic(expected = "Schedule is paused")]
 fn test_execute_payment_while_paused_panics() {
     let (env, contract_id, _, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
@@ -323,6 +326,26 @@ fn test_resume_allows_execution() {
 }
 
 #[test]
+#[should_panic(expected = "schedule is already paused")]
+fn test_pause_already_paused_panics() {
+    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    client.pause_recurring_payment(&sender, &id);
+    client.pause_recurring_payment(&sender, &id);
+}
+
+#[test]
+#[should_panic(expected = "schedule is cancelled")]
+fn test_resume_cancelled_schedule_panics() {
+    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    client.cancel_recurring_payment(&sender, &id);
+    client.resume_recurring_payment(&sender, &id);
+}
+
+#[test]
 #[should_panic(expected = "only the sender can pause")]
 fn test_pause_by_non_sender_panics() {
     let (env, contract_id, _, sender, recipient, executor, _) = setup();
@@ -339,16 +362,6 @@ fn test_resume_by_non_sender_panics() {
     let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
     client.pause_recurring_payment(&sender, &id);
     client.resume_recurring_payment(&executor, &id);
-}
-
-#[test]
-#[should_panic(expected = "schedule is not active")]
-fn test_pause_already_paused_panics() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
-    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
-    client.pause_recurring_payment(&sender, &id);
-    client.pause_recurring_payment(&sender, &id);
 }
 
 #[test]
