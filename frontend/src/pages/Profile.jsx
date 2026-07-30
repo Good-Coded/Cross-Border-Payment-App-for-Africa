@@ -476,6 +476,11 @@ export default function Profile() {
 
   const handleCloseAccount = async (e) => {
     e.preventDefault();
+    const dest = closeDestination.trim();
+    if (!dest.startsWith('G') || dest.length !== 56 || !/^[A-Z0-9]+$/.test(dest)) {
+      toast.error('Invalid Stellar destination address. Must be a 56-character public key starting with G.');
+      return;
+    }
     if (
       !window.confirm(
         'FINAL WARNING: This will permanently close your Stellar account and transfer all XLM to the destination. This cannot be undone. Continue?'
