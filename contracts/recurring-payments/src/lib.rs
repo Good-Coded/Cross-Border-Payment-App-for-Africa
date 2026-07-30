@@ -206,6 +206,9 @@ impl RecurringPaymentsContract {
         if interval == 0 {
             panic!("interval must be > 0");
         }
+        if max_executions == u64::MAX {
+            panic!("Invalid max_executions");
+        }
 
         sender.require_auth();
 
@@ -550,17 +553,17 @@ impl RecurringPaymentsContract {
     }
 
     /// Read a schedule by ID.
-    pub fn get_recurring_payment(env: Env, schedule_id: u64) -> RecurringSchedule {
+    pub fn get_schedule(env: Env, schedule_id: u64) -> RecurringSchedule {
         env.storage()
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
             .expect("schedule not found")
     }
 
-    /// Deprecated alias for get_recurring_payment. Use get_recurring_payment instead.
+    /// Deprecated alias for get_schedule. Use get_schedule instead.
     #[deprecated]
-    pub fn get_schedule(env: Env, schedule_id: u64) -> RecurringSchedule {
-        Self::get_recurring_payment(env, schedule_id)
+    pub fn get_recurring_payment(env: Env, schedule_id: u64) -> RecurringSchedule {
+        Self::get_schedule(env, schedule_id)
     }
 
     /// Update the payment amount for a recurring schedule. Only the sender may update.
@@ -635,12 +638,32 @@ impl RecurringPaymentsContract {
                 updated_by: sender,
             },
         );
+    }
+
     /// Return the current consecutive missed-execution count for a schedule.
     pub fn get_missed_executions(env: Env, schedule_id: u64) -> u64 {
         env.storage()
             .persistent()
             .get(&DataKey::MissedExecutions(schedule_id))
             .unwrap_or(0)
+    }
+
+    /// Return the remaining executions for a schedule.
+    /// Returns None for unlimited schedules (max_executions = 0).
+    /// Returns Some(remaining) for bounded schedules.
+    pub fn get_remaining_executions(env: Env, schedule_id: u64) -> Option<u64> {
+        let schedule: RecurringSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("schedule not found");
+        if schedule.max_executions == 0 {
+            None
+        } else if schedule.executions_completed >= schedule.max_executions {
+            Some(0)
+        } else {
+            Some(schedule.max_executions - schedule.executions_completed)
+        }
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

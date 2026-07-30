@@ -119,19 +119,22 @@ impl KycAttestationContract {
         if kyc_hash.len() == 0 {
             panic!("kyc_hash must not be empty");
         }
+        if expires_at != 0 && expires_at <= env.ledger().timestamp() {
+            panic!("expires_at must be greater than current timestamp");
+        }
 
         let key = DataKey::TieredAttestation(user.clone(), tier.clone());
 
-        // Prevent overwriting an active attestation for the same tier
-        if let Some(existing) = env.storage().persistent().get::<_, Attestation>(&key) {
-            if existing.revoked_at == 0 {
-                panic!("user already has an active attestation for this tier");
-            }
-        }
+        // Allow re-attestation: update existing attestation if present
+        let original_attested_at = if let Some(existing) = env.storage().persistent().get::<_, Attestation>(&key) {
+            existing.attested_at
+        } else {
+            0
+        };
 
         let record = Attestation {
             kyc_hash,
-            attested_at: env.ledger().timestamp(),
+            attested_at: if original_attested_at > 0 { original_attested_at } else { env.ledger().timestamp() },
             revoked_at: 0,
             expires_at,
         };
@@ -217,6 +220,12 @@ impl KycAttestationContract {
             }
         }
         None
+    }
+
+    /// Returns true if user has a current, non-revoked, non-expired attestation for tier.
+    /// Convenience function combining revocation and expiry checks.
+    pub fn is_valid_and_unexpired(env: Env, user: Address, tier: KycTier) -> bool {
+        Self::is_verified(env, user, tier)
     }
 
     /// Revoke attestations for multiple users atomically.

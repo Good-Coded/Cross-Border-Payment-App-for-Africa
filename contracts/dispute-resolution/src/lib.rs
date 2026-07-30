@@ -80,6 +80,11 @@ pub enum DataKey {
     /// Individual vote cast by one panel arbitrator on a dispute.
     /// Value is `bool`: `true` = for recipient, `false` = for sender.
     Vote(u64, Address),
+    /// Vec<u64> of dispute IDs for a user (as sender or recipient).
+    /// Bounded to 1000 entries per user (circular buffer).
+    UserDisputes(Address),
+    /// Total number of disputes opened (for admin pagination).
+    TotalDisputes,
 }
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -232,6 +237,7 @@ impl DisputeResolutionContract {
         env.storage().persistent().set(&DataKey::SuperArbitrator, &super_arbitrator);
         env.storage().persistent().set(&DataKey::FilingFee, &50_000000i128);
         env.storage().persistent().set(&DataKey::FeeDistributorAddress, &admin);
+        env.storage().persistent().set(&DataKey::TotalDisputes, &0u64);
         // Initialise the arbitrator panel with an empty list and the default quorum.
         let empty: Vec<Address> = Vec::new(&env);
         env.storage().persistent().set(&DataKey::Arbitrators, &empty);
@@ -317,6 +323,22 @@ impl DisputeResolutionContract {
         env.storage()
             .persistent()
             .set(&DataKey::FilingFeeHolder(id), &opener);
+
+        // Update TotalDisputes counter
+        let total_disputes: u64 = env.storage().persistent().get(&DataKey::TotalDisputes).unwrap_or(0);
+        env.storage().persistent().set(&DataKey::TotalDisputes, &(total_disputes + 1));
+
+        // Add dispute ID to UserDisputes for both sender and recipient (circular buffer, max 1000)
+        for user in [sender.clone(), recipient.clone()] {
+            let mut user_disputes: Vec<u64> = env.storage().persistent()
+                .get(&DataKey::UserDisputes(user.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+            if user_disputes.len() >= 1000 {
+                user_disputes.remove(0);
+            }
+            user_disputes.push_back(id);
+            env.storage().persistent().set(&DataKey::UserDisputes(user), &user_disputes);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "DisputeOpened"),),
@@ -1023,5 +1045,42 @@ impl DisputeResolutionContract {
             .persistent()
             .get(&DataKey::QuorumBps)
             .unwrap_or(DEFAULT_QUORUM_BPS)
+    }
+
+    /// Get paginated dispute IDs for a user (as sender or recipient).
+    /// Limit capped at 50 per call.
+    pub fn get_disputes_for_user(env: Env, user: Address, start: u32, limit: u32) -> Vec<u64> {
+        let capped_limit = if limit > 50 { 50 } else { limit };
+        let user_disputes: Vec<u64> = env.storage().persistent()
+            .get(&DataKey::UserDisputes(user))
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        let total = user_disputes.len();
+        let actual_start = if start as usize > total { total } else { start as usize };
+        let actual_end = if actual_start + capped_limit as usize > total { total } else { actual_start + capped_limit as usize };
+        
+        let mut result: Vec<u64> = Vec::new(&env);
+        for i in actual_start..actual_end {
+            if let Some(id) = user_disputes.get(i) {
+                result.push_back(id);
+            }
+        }
+        result
+    }
+
+    /// Get all disputes with pagination (admin-accessible, public data).
+    /// Uses TotalDisputes counter for offset-based pagination.
+    pub fn get_all_disputes(env: Env, start: u32, limit: u32) -> Vec<u64> {
+        let capped_limit = if limit > 50 { 50 } else { limit };
+        let total_disputes: u64 = env.storage().persistent().get(&DataKey::TotalDisputes).unwrap_or(0);
+        
+        let actual_start = if start as u64 > total_disputes { total_disputes } else { start as u64 };
+        let actual_end = if actual_start + capped_limit as u64 > total_disputes { total_disputes } else { actual_start + capped_limit as u64 };
+        
+        let mut result: Vec<u64> = Vec::new(&env);
+        for i in actual_start..actual_end {
+            result.push_back(i + 1); // Dispute IDs are 1-indexed
+        }
+        result
     }
 }
