@@ -20,11 +20,12 @@ pub enum DataKey {
     FeeBps,
     Schedule(u64),
     Counter,
-    /// Maximum consecutive misses allowed before a schedule is auto-cancelled.
-    /// Stored globally; overridable per schedule via RecurringSchedule::max_missed_executions.
     MaxMissedExecutions,
-    /// Tracks the total consecutive missed-execution count for a given schedule ID.
     MissedExecutions(u64),
+    /// Vec<u64> of schedule IDs for a given sender address.
+    UserSchedules(Address),
+    /// Global schedule count for full enumeration.
+    TotalSchedules,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -243,6 +244,30 @@ impl RecurringPaymentsContract {
         env.storage()
             .persistent()
             .set(&DataKey::Schedule(id), &schedule);
+
+        // Update UserSchedules for the sender (bounded to 500 per sender).
+        let mut user_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserSchedules(sender.clone()))
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        if user_ids.len() >= 500 {
+            panic!("Schedule limit per sender reached");
+        }
+        user_ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserSchedules(sender.clone()), &user_ids);
+
+        // Increment global TotalSchedules counter.
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalSchedules)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalSchedules, &(total + 1));
 
         // Initialise the missed-executions counter for this schedule ID.
         env.storage()
@@ -644,6 +669,61 @@ impl RecurringPaymentsContract {
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
+
+    /// Returns paginated schedule IDs for a given sender. Limit capped at 50.
+    pub fn get_user_schedules(env: Env, sender: Address, start: u32, limit: u32) -> soroban_sdk::Vec<u64> {
+        let cap = if limit > 50 { 50 } else { limit };
+        let ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserSchedules(sender))
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        let mut result: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+        let len = ids.len();
+        let mut i = start;
+        while i < len && (i - start) < cap {
+            result.push_back(ids.get(i).unwrap());
+            i += 1;
+        }
+        result
+    }
+
+    /// Returns the full schedule struct for a given ID.
+    pub fn get_schedule_by_id(env: Env, schedule_id: u64) -> RecurringSchedule {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("schedule not found")
+    }
+
+    /// Returns paginated IDs of schedules with Active status. Limit capped at 50.
+    pub fn get_active_schedules(env: Env, start: u64, limit: u64) -> soroban_sdk::Vec<u64> {
+        let cap = if limit > 50 { 50 } else { limit };
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalSchedules)
+            .unwrap_or(0);
+        let mut result: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+        let mut scanned: u64 = 0;
+        let mut id: u64 = 1;
+        while id <= total && scanned < start + cap {
+            if let Some(s) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, RecurringSchedule>(&DataKey::Schedule(id))
+            {
+                if s.status == ScheduleStatus::Active {
+                    if scanned >= start {
+                        result.push_back(id);
+                    }
+                    scanned += 1;
+                }
+            }
+            id += 1;
+        }
+        result
+    }
 
     fn next_id(env: &Env) -> u64 {
         let current: u64 = env
