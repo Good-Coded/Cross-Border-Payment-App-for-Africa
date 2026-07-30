@@ -2,24 +2,16 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
-const logger = require('../utils/logger');
+const {
+  MIME_EXTENSIONS,
+  matchesMagicBytes,
+  tryClamScan,
+  computeSha256,
+  cleanupFile,
+} = require('../utils/fileValidation');
 
 const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'application/pdf'];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
-
-const MAGIC_SIGNATURES = {
-  'image/jpeg': [[0xFF, 0xD8, 0xFF]],
-  'image/png': [[0x89, 0x50, 0x4E, 0x47]],
-  'image/gif': [[0x47, 0x49, 0x46, 0x38, 0x37, 0x61], [0x47, 0x49, 0x46, 0x38, 0x39, 0x61]],
-  'application/pdf': [[0x25, 0x50, 0x44, 0x46]],
-};
-
-const MIME_EXTENSIONS = {
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/gif': '.gif',
-  'application/pdf': '.pdf',
-};
 
 function getUploadDir() {
   const baseDir = path.resolve(__dirname, '../../../uploads/disputes');
@@ -61,46 +53,6 @@ function getUploader(disputeId) {
   }).single('file');
 }
 
-function matchesMagicBytes(filePath, mimeType) {
-  const signatures = MAGIC_SIGNATURES[mimeType];
-  if (!signatures) return false;
-
-  const maxLen = Math.max(...signatures.map(s => s.length));
-  const buf = Buffer.alloc(maxLen);
-  const fd = fs.openSync(filePath, 'r');
-  try {
-    fs.readSync(fd, buf, 0, maxLen, 0);
-  } finally {
-    fs.closeSync(fd);
-  }
-
-  return signatures.some(sig =>
-    sig.every((byte, i) => buf[i] === byte)
-  );
-}
-
-async function computeSha256(filePath) {
-  const crypto = require('crypto');
-  const hash = crypto.createHash('sha256');
-  const stream = fs.createReadStream(filePath);
-  return new Promise((resolve, reject) => {
-    stream.pipe(hash).on('finish', () => resolve(hash.read().toString('hex')));
-    stream.on('error', reject);
-  });
-}
-
-async function tryClamScan(filePath) {
-  try {
-    const NodeClam = require('clamscan');
-    const scanner = await new NodeClam().init();
-    const { isInfected } = await scanner.scanFile(filePath);
-    return isInfected;
-  } catch {
-    logger.warn('ClamAV not configured — skipping malware scan', { filePath });
-    return false;
-  }
-}
-
 function disputeEvidenceMiddleware(req, res, next) {
   const disputeId = req.params.id;
   const upload = getUploader(disputeId);
@@ -108,7 +60,7 @@ function disputeEvidenceMiddleware(req, res, next) {
   upload(req, res, async (err) => {
     if (err) {
       if (req.file) {
-        try { fs.unlinkSync(req.file.path); } catch {}
+        cleanupFile(req.file.path);
       }
       if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(400).json({ error: 'Each file must be 10 MB or smaller' });
@@ -121,7 +73,7 @@ function disputeEvidenceMiddleware(req, res, next) {
     }
 
     if (!matchesMagicBytes(req.file.path, req.file.mimetype)) {
-      try { fs.unlinkSync(req.file.path); } catch {}
+      cleanupFile(req.file.path);
       return res.status(400).json({
         error: `File "${req.file.originalname}" failed content validation — file content does not match declared type`,
       });
@@ -129,7 +81,7 @@ function disputeEvidenceMiddleware(req, res, next) {
 
     const isInfected = await tryClamScan(req.file.path);
     if (isInfected) {
-      try { fs.unlinkSync(req.file.path); } catch {}
+      cleanupFile(req.file.path);
       return res.status(400).json({
         error: `File "${req.file.originalname}" was rejected by the malware scanner`,
       });
