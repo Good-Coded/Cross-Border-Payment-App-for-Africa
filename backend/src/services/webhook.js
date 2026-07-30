@@ -1,8 +1,6 @@
-const crypto = require('crypto');
 const https = require('https');
 const db = require('../db');
-const logger = require('../utils/logger');
-const { isPrivateIp } = require('../utils/ssrfValidator');
+const { sign } = require('../utils/webhookSignature');
 const { validateOutboundUrl } = require('../utils/ssrf');
 const { decryptSecret } = require('../utils/symmetricEncryption');
 
@@ -24,31 +22,15 @@ async function isPublicHttpsUrl(url) {
     return false;
   }
 
-  const hostname = parsed.hostname;
-
-  // Reject bare private IPs
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) && isPrivateIp(hostname)) {
-    return false;
-  }
-
-  // Resolve and check returned IP
-  try {
-    const { address } = await require('dns').promises.lookup(hostname);
-    if (isPrivateIp(address)) {
-      return false;
-    }
-  } catch {
+  const ssrfCheck = await validateOutboundUrl(url);
+  if (!ssrfCheck.valid) {
     return false;
   }
 
   return true;
 }
 
-function sign(secret, payload) {
-  return crypto.createHmac('sha256', secret).update(payload).digest('hex');
-}
-
-function httpsPost(url, body, signature) {
+function httpsPost(url, body, signature, agent) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const options = {
@@ -61,6 +43,8 @@ function httpsPost(url, body, signature) {
         'Content-Length': Buffer.byteLength(body),
         'X-AfriPay-Signature-256': `sha256=${signature}`,
       },
+      // Use the DNS-pinned agent from SSRF validation to prevent rebinding
+      ...(agent && { agent }),
     };
     const req = https.request(options, (res) => {
       res.resume();
@@ -79,24 +63,23 @@ function httpsPost(url, body, signature) {
 async function createDeliveryLog(webhookId, eventType, targetUrl, attempt, maxAttempts, payload) {
   const { rows } = await db.query(
     `INSERT INTO webhook_deliveries (webhook_id, event_type, target_url, status, attempt, max_attempts, payload)
-     VALUES ($1, $2, $3, 'pending', $4, $5, $6)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING id`,
-    [webhookId, eventType, targetUrl, attempt, maxAttempts, JSON.stringify(payload)]
+    [webhookId, eventType, targetUrl, 'pending', attempt, maxAttempts, JSON.stringify(payload)]
   );
   return rows[0].id;
 }
 
-async function updateDeliveryLog(deliveryId, status, statusCode, responseTimeMs, errorMessage) {
+async function updateDeliveryLog(id, status, statusCode, responseTime, error) {
   await db.query(
     `UPDATE webhook_deliveries
-     SET status = $1, status_code = $2, response_time_ms = $3, error_message = $4, completed_at = NOW()
+     SET status = $1, response_status = $2, response_time_ms = $3, error = $4, delivered_at = NOW()
      WHERE id = $5`,
-    [status, statusCode || null, responseTimeMs || null, errorMessage || null, deliveryId]
+    [status, statusCode, responseTime, error, id]
   );
 }
 
-async function deliverWithRetry(webhookId, url, secret, payload, attempt = 0) {
-  // Re-validate URL before each delivery to catch DNS rebinding / stale records
+async function deliverWebhook(webhookId, url, secret, payload, attempt = 0) {
   const ssrfCheck = await validateOutboundUrl(url);
   if (!ssrfCheck.valid) {
     logger.error('Webhook delivery blocked: URL failed SSRF validation', { url, reason: ssrfCheck.error });
@@ -109,7 +92,7 @@ async function deliverWithRetry(webhookId, url, secret, payload, attempt = 0) {
   const deliveryId = await createDeliveryLog(webhookId, payload.event, url, attempt + 1, MAX_ATTEMPTS, payload);
   const start = Date.now();
   try {
-    const statusCode = await httpsPost(url, body, signature);
+    const statusCode = await httpsPost(url, body, signature, ssrfCheck.agent);
     const responseTime = Date.now() - start;
     await updateDeliveryLog(deliveryId, 'delivered', statusCode, responseTime, null);
   } catch (err) {
@@ -118,52 +101,11 @@ async function deliverWithRetry(webhookId, url, secret, payload, attempt = 0) {
     const statusCode = statusCodeMatch ? parseInt(statusCodeMatch[1]) : null;
     if (attempt < MAX_ATTEMPTS - 1) {
       const delay = Math.pow(2, attempt) * 1000;
-      logger.warn('Webhook delivery failed, retrying', {
-        url,
-        attempt: attempt + 1,
-        maxAttempts: MAX_ATTEMPTS,
-        delay,
-        error: err.message,
-      });
-      await new Promise((r) => setTimeout(r, delay));
-      return deliverWithRetry(webhookId, url, secret, payload, attempt + 1);
+      setTimeout(() => deliverWebhook(webhookId, url, secret, payload, attempt + 1), delay);
+    } else {
+      await updateDeliveryLog(deliveryId, 'failed', statusCode, responseTime, err.message);
     }
-    // All attempts exhausted
-    await updateDeliveryLog(deliveryId, 'failed', statusCode, responseTime, err.message);
-    logger.error('Webhook delivery permanently failed after max retries', {
-      url,
-      event: payload.event,
-      attempts: MAX_ATTEMPTS,
-      error: err.message,
-    });
   }
 }
 
-async function retryDelivery(deliveryId) {
-  const { rows } = await db.query(
-    `SELECT wd.webhook_id, wd.target_url, wd.payload, wd.event_type, w.url, w.secret
-     FROM webhook_deliveries wd
-     JOIN webhooks w ON w.id = wd.webhook_id
-     WHERE wd.id = $1 AND wd.status = 'failed'`,
-    [deliveryId]
-  );
-  if (!rows.length) throw new Error('Delivery not found or not failed');
-  const { url, secret, payload, event_type } = rows[0];
-  const parsedPayload = typeof payload === 'string' ? JSON.parse(payload) : payload;
-  await deliverWithRetry(null, url, secret, { ...parsedPayload, event: event_type });
-}
-
-async function deliver(event, data) {
-  const { rows } = await db.query(
-    `SELECT id, url, secret FROM webhooks WHERE active = true AND $1 = ANY(events)`,
-    [event]
-  );
-  const timestamp = Math.floor(Date.now() / 1000);
-  const payload = { timestamp, event, data };
-  await Promise.all(rows.map((wh) => {
-    const plainSecret = decryptSecret(wh.secret);
-    return deliverWithRetry(wh.url, plainSecret, payload);
-  }));
-}
-
-module.exports = { deliver, sign, retryDelivery, MAX_ATTEMPTS };
+module.exports = { deliverWebhook };
