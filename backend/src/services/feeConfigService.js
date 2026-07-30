@@ -22,7 +22,7 @@ async function refreshCache() {
     grouped[key] = row;
   }
 
-  const keysToDelete = [];
+  let keysToDelete = [];
   try {
     const redis = cache.getClient();
     if (redis) {
